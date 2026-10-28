@@ -511,7 +511,7 @@ def push(repo):
         got, _ = api("GET", f"repos/{OWNER}/{TARGET}")
         if not got:
             sys.exit(f"could not create the private repo: {err}")
-        if got or got.get("open_issues_count") or api("GET", f"repos/{OWNER}/{TARGET}/issues?state=all&per_page=1")[0]:
+        if got.get("open_issues_count") or api("GET", f"repos/{OWNER}/{TARGET}/issues?state=all&per_page=1")[0]:
             sys.exit("the target repo already exists and has issues; stopping")
         m.log("reusing the existing private repo (no issues yet)")
     elif err:
