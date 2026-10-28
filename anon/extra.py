@@ -21,6 +21,7 @@ import io
 import os
 import re
 import struct
+import time
 import zipfile
 import zlib
 from urllib.parse import urlparse
@@ -161,11 +162,14 @@ def precompute(repo, paths, process, stats):
     _PRE = (repo, paths, process, stats, cache)
     chunks = [oids[i::n * 16] for i in range(n * 16)]
     unchanged = set()
+    t0 = time.time()
     with multiprocessing.get_context("fork").Pool(n) as pool:
-        for got, added in pool.imap_unordered(_pre_work, chunks):
+        for i, (got, added) in enumerate(pool.imap_unordered(_pre_work, chunks), 1):
             unchanged.update(got)
             for k, v in added.items():
                 stats[k] = stats.get(k, 0) + v
+            if i % (len(chunks) // 4) == 0:
+                print(f"  blobs anonymised: {i * 100 // len(chunks)}% of {len(oids)} in {time.time() - t0:.0f}s", flush=True)
     _PRE = None
     return unchanged, cache
 
