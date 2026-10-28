@@ -68,7 +68,8 @@ ALIASES = [a.strip() for a in (JOB.get("aliases") or "").split(",") if a.strip()
 NAMES = [a.strip() for a in (JOB.get("names") or "").split(",") if a.strip()]  # replace these, not the repo name
 OWNERS = [a.strip() for a in (JOB.get("owners") or "").split(",") if a.strip()]  # the owner's other accounts
 KEEP_OWNER = bool(JOB.get("keep_owner"))  # the owner is also a framework the code imports
-mask(SOURCE, *SOURCE.split("/"), TARGET, GIVEN_NAME, *ALIASES, *NAMES, *OWNERS)
+PEOPLE = [a.strip() for a in (JOB.get("people") or "").split(",") if a.strip()]  # other real names to replace
+mask(SOURCE, *SOURCE.split("/"), TARGET, GIVEN_NAME, *ALIASES, *NAMES, *OWNERS, *PEOPLE)
 MODE = os.environ.get("MODE", "all")
 PR_LABEL, MERGED_LABEL = "pull request", "merged"
 MAX_BODY = 60000
@@ -269,6 +270,7 @@ def anonymise():
                       if len(f.get("Secret") or "") >= m.MIN_SECRET}, key=len, reverse=True)
     m.log(f"scan: {len(findings) + len(api_findings)} findings, {len(secrets)} secrets")
     ids = m.collect_identities(repo, data)
+    ids.update({p: m.PSEUDO.name(p) for p in PEOPLE if p not in ids})  # names only found in the files
     anon = ANON(ids)
     cmap, removed, after = m.clean_repo(repo, secrets, anon, WORK, "repo")
     m.log(f"rewritten: {len(cmap)} commits, {removed} LICENSE paths removed, {len(after)} findings left")
