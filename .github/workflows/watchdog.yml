@@ -1,0 +1,51 @@
+name: Watchdog
+
+# Restarts any anonymisation chain whose hand-over was lost: a finished run that left a "next" artifact (it had
+# more to do, or hit a problem with retries left) but no run was started from it. The new run continues from
+# that run's saved state, so nothing is redone from scratch. Set the repo variable WATCHDOG to "off" to pause.
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: vars.WATCHDOG != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Restart lost hand-overs
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+          R: ${{ github.repository }}
+        run: |
+          export GH_TOKEN=$OWN
+          since=$(date -u -d '-12 hours' +%FT%TZ)
+          settle=$(date -u -d '-10 minutes' +%FT%TZ)
+          runs="repos/$R/actions/workflows/anonymise.yml/runs?created=>$(date -u -d '-6 days' +%F)&per_page=100"
+          gh api --paginate "$runs" -q '.workflow_runs[].display_title' > titles.txt
+          gh api --paginate "$runs&status=completed" \
+            -q ".workflow_runs[]|select(.updated_at > \"$since\" and .updated_at < \"$settle\")|.id" > done.txt
+          restarted=0
+          for id in $(cat done.txt); do
+            grep -q ", from $id)" titles.txt && continue  # its successor exists
+            gh api "repos/$R/actions/runs/$id/artifacts" -q '.artifacts[]|select(.name=="next" and (.expired|not))|.id' | grep -q . || continue
+            rm -rf n && gh run download "$id" -R "$R" -n next -D n || continue
+            { read -r mode; read -r attempt; read -r job; } < n/next.txt
+            for t in "$OWN" "$PAT"; do
+              if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job" -f mode="$mode" -f from_run="$id" -f attempt="$attempt"; then
+                echo "restarted the chain of run $id ($mode, attempt $attempt)" | tee -a "$GITHUB_STEP_SUMMARY"
+                restarted=$((restarted + 1)); break
+              fi
+            done
+          done
+          echo "checked $(wc -l < done.txt) finished run(s), restarted $restarted" | tee -a "$GITHUB_STEP_SUMMARY"

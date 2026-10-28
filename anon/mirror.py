@@ -73,9 +73,12 @@ def git_date(raw):
 def iso_date(m):
     tz = m.group(4)
     tz = "+00:00" if tz == "Z" else (tz if ":" in tz else tz[:3] + ":" + tz[3:])
-    dt = datetime.datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}{m.group(3) or ''}{tz}")
-    t = round_epoch(int(dt.timestamp()) + (1 if dt.microsecond else 0))
-    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        dt = datetime.datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}{m.group(3) or ''}{tz}")
+        t = round_epoch(int(dt.timestamp()) + (1 if dt.microsecond else 0))
+        return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):  # placeholder dates such as 0000-00-00 or 0001-01-01: kept as text
+        return m.group(0)
 
 FIRST = """Aldric Amara Anouk Arlo Aurelie Bastien Belen Bram Calla Caspian Celeste Corin Dalia Damek Delphine Desmond
 Edda Elian Elodie Emeric Esme Evander Fenna Florin Freya Gideon Greta Halden Hana Idris Ilse Imogen Ione Isak Jarek
