@@ -27,7 +27,7 @@ run-name: Anonymise (${{ inputs.mode }}, attempt ${{ inputs.attempt }})
 
 permissions:
   contents: read
-  actions: read
+  actions: write  # the workflow starts its own next run
 
 jobs:
   anonymise:
@@ -94,25 +94,43 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # Starting the next run can be refused by a rate limit: it is tried with the workflow's own token (its own
+      # quota) and then the PAT, again and again for about 25 minutes, and never fails the run (no failure emails).
       - name: Continue in a new run
         if: steps.anon.outcome == 'success' && steps.anon.outputs.more == 'true'
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
           JOB: ${{ inputs.job }}
-        run: gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode="${{ steps.anon.outputs.next }}" -f from_run="${{ github.run_id }}"
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            for t in "$OWN" "$PAT"; do
+              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode="${{ steps.anon.outputs.next }}" -f from_run="${{ github.run_id }}" && exit 0
+            done
+            sleep $(( i * 30 ))
+          done
+          echo "COULD NOT START THE NEXT RUN - continue from run ${{ github.run_id }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Retry after a problem
         if: steps.anon.outcome == 'failure' && inputs.attempt != '3'
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
           JOB: ${{ inputs.job }}
         run: |
           # History already pushed: only the issue import is retried. Either way the saved state (fetched history,
           # import progress) carries over.
-          if [ -f state/pushed ]; then mode=issues; else mode=all; fi; from=${{ github.run_id }}
+          if [ -f state/pushed ]; then mode=issues; else mode=all; fi
           sleep 120
-          gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=$mode -f from_run="$from" -f attempt=$(( ${{ inputs.attempt }} + 1 ))
-          echo "Problem in attempt ${{ inputs.attempt }}; retrying ($mode)" >> "$GITHUB_STEP_SUMMARY"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            for t in "$OWN" "$PAT"; do
+              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=$mode -f from_run="${{ github.run_id }}" -f attempt=$(( ${{ inputs.attempt }} + 1 )) && { echo "Problem in attempt ${{ inputs.attempt }}; retrying ($mode)" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            done
+            sleep $(( i * 30 ))
+          done
+          echo "COULD NOT START THE RETRY - continue from run ${{ github.run_id }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Report a problem that retries did not fix
         if: steps.anon.outcome == 'failure' && inputs.attempt == '3'
