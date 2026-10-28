@@ -23,6 +23,7 @@ READ_TOKEN (optional second token with its own quota, used to read a public sour
 Writes state/ (fetch/, api.json, progress.json, pushed) and sets the step outputs more=true and next=<mode>
 when a new run must continue.
 """
+import calendar
 import json
 import os
 import re
@@ -116,17 +117,52 @@ def handoff(stage):
 
 
 QUOTA = {}  # token -> (requests left, reset epoch)
+APP = {"token": None, "until": 0}
 
 
-def pick_token(toks):
+def app_token():
+    """An installation token of the optional GitHub App (secrets APP_ID, APP_KEY): its own hourly quota. Tokens
+    last an hour, so a new one is made every 50 minutes (JWT signed with openssl, no extra packages)."""
+    if time.time() < APP["until"]:
+        return APP["token"]
+    import base64
+    import urllib.request
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=")  # noqa: E731
+    now = int(time.time())
+    head = b64(b'{"alg":"RS256","typ":"JWT"}') + b"." + b64(json.dumps(
+        {"iat": now - 60, "exp": now + 540, "iss": os.environ["APP_ID"].strip()}).encode())
+    key = os.path.join(WORK, "app.pem")
+    with open(key, "w") as f:
+        f.write(os.environ["APP_KEY"].strip() + "\n")
+    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key], input=head, capture_output=True, check=True).stdout
+    jwt = (head + b"." + b64(sig)).decode()
+
+    def call(url, method="GET"):
+        req = urllib.request.Request(url, method=method, headers={
+            "Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    inst = call(f"https://api.github.com/users/{OWNER}/installation")
+    tok = call(f"https://api.github.com/app/installations/{inst['id']}/access_tokens", "POST")["token"]
+    print(f"::add-mask::{tok}", flush=True)
+    APP.update(token=tok, until=time.time() + 50 * 60)
+    return tok
+
+
+def real(t):
+    """Token names in the pick lists: "APP" stands for the App's current installation token."""
+    return app_token() if t == "APP" else t
+
+
+def pick_token(toks, quota=QUOTA):
     """A token with quota left; waits for the earliest reset, or hands off when that is past the budget."""
     while True:
         now = time.time()
         for t in toks:
-            left, reset = QUOTA.get(t, (100, 0))
+            left, reset = quota.get(t, (100, 0))
             if left > 20 or reset < now:
                 return t
-        wake = min(QUOTA[t][1] for t in toks) + 30
+        wake = min(quota[t][1] for t in toks) + 30
         if wake - T0 > BUDGET:
             raise Handoff
         m.log(f"  API quota used up; waiting {round((wake - now) / 60)} min for the reset")
@@ -137,7 +173,7 @@ def get(path, toks):
     """One GET page. Returns (json, None) or (None, error); quota and transient errors are waited out."""
     for attempt in range(1, 9):
         t = pick_token(toks)
-        p = subprocess.run(["gh", "api", "-i", path], env=m.gh_env(t), capture_output=True)
+        p = subprocess.run(["gh", "api", "-i", path], env=m.gh_env(real(t)), capture_output=True)
         head, _, body = p.stdout.replace(b"\r\n", b"\n").partition(b"\n\n")
         lines = head.decode(errors="replace").split("\n")
         try:
@@ -201,11 +237,179 @@ def load_list(key):
     return list(by_id.values())
 
 
+GQUOTA = {}  # GraphQL has its own hourly budget per token (points, not requests)
+WHO = "author { login }"
+COMMENTS = f"comments(first: 100) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ databaseId body createdAt {WHO} }} }}"
+REVIEW_COMMENTS = (f"comments(first: 20) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ databaseId path body createdAt "
+                   f"{WHO} }} }}")
+REVIEWS = (f"reviews(first: 20) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ id state body submittedAt {WHO} "
+           f"{REVIEW_COMMENTS} }} }}")
+ITEM = f"id number title body state createdAt updatedAt closedAt {WHO} labels(first: 50) {{ nodes {{ name }} }} {COMMENTS}"
+
+
+def gql(query, variables, toks):
+    """One GraphQL call. Returns (data, None) or (None, error); "timeout" means: ask for a smaller page."""
+    query = query.replace("{", "{ rateLimit { remaining resetAt }", 1)
+    err = "gave up"
+    for attempt in range(1, 9):
+        t = pick_token(toks, GQUOTA)
+        p = subprocess.run(["gh", "api", "graphql", "--input", "-"], env=m.gh_env(real(t)), capture_output=True,
+                           input=json.dumps({"query": query, "variables": variables}).encode())
+        try:
+            res = json.loads(p.stdout)
+        except ValueError:
+            res = None
+        rl = ((res or {}).get("data") or {}).get("rateLimit")
+        if rl:
+            GQUOTA[t] = (rl["remaining"], calendar.timegm(time.strptime(rl["resetAt"], "%Y-%m-%dT%H:%M:%SZ")))
+        if res and res.get("data") and not res.get("errors"):
+            return res["data"], None
+        err = (json.dumps(res.get("errors")) if res else p.stderr.decode(errors="replace"))[-300:]
+        if "RATE_LIMITED" in err or "rate limit" in err.lower():
+            if GQUOTA.get(t, (1, 0))[0] > 0:  # secondary limit: back off this token for a while
+                GQUOTA[t] = (0, time.time() + 60 * attempt)
+            continue
+        if any(x in err.lower() for x in ("timeout", "timed out", "502", "504", "something went wrong")):
+            return None, "timeout"
+        if res and res.get("data") and res.get("errors"):  # partial data (e.g. a deleted author): keep it
+            return res["data"], None
+        time.sleep(10 * attempt)
+    return None, err
+
+
+def more_nodes(node_id, kind, field, after, toks):
+    """The rest of a nested list (comments of a busy issue, reviews or review comments) past its first page."""
+    body = {"comments": COMMENTS, "reviews": REVIEWS, "review_comments": REVIEW_COMMENTS}[field]
+    body = body.replace("(first: ", "(after: $a, first: ", 1)
+    q = f"query($id: ID!, $a: String) {{ node(id: $id) {{ ... on {kind} {{ {body} }} }} }}"
+    data, err = gql(q, {"id": node_id, "a": after}, toks)
+    return (data or {}).get("node") or {}
+
+
+def complete(node, kind, toks):
+    """Follow every nested list of one issue/PR to its end."""
+    for field in ("comments", "reviews"):
+        conn = node.get(field)
+        while conn and conn["pageInfo"]["hasNextPage"]:
+            got = more_nodes(node["id"], kind, field, conn["pageInfo"]["endCursor"], toks).get(field)
+            if not got:
+                break
+            conn["nodes"] += got["nodes"]
+            conn["pageInfo"] = got["pageInfo"]
+    for r in (node.get("reviews") or {}).get("nodes", []):
+        conn = r.get("comments")
+        while conn and conn["pageInfo"]["hasNextPage"]:
+            got = more_nodes(r["id"], "PullRequestReview", "review_comments", conn["pageInfo"]["endCursor"], toks)
+            got = got.get("comments")
+            if not got:
+                break
+            conn["nodes"] += got["nodes"]
+            conn["pageInfo"] = got["pageInfo"]
+
+
+def gql_list(kind, toks):
+    """All issues or pull requests (kind: issues | pullRequests) with their nested lists, page by page into
+    state/fetch/gql_<kind>.jsonl; the cursor lets a later run resume."""
+    cur_path = os.path.join(FETCH, f"gql_{kind}.cursor")
+    cur = {"after": None, "size": 50 if kind == "issues" else 20, "done": False}
+    if os.path.exists(cur_path):
+        with open(cur_path) as f:
+            cur = json.load(f)
+    extra = "mergedAt " + REVIEWS if kind == "pullRequests" else ""
+    q = (f"query($o: String!, $n: String!, $a: String, $s: Int!) {{ repository(owner: $o, name: $n) {{ "
+         f"{kind}(first: $s, after: $a, orderBy: {{field: CREATED_AT, direction: ASC}}) {{ "
+         f"pageInfo {{ hasNextPage endCursor }} nodes {{ {ITEM} {extra} }} }} }} }}")
+    owner, name = SOURCE.split("/")
+    with open(os.path.join(FETCH, f"gql_{kind}.jsonl"), "a", encoding="utf-8") as f:
+        while not cur["done"]:
+            data, err = gql(q, {"o": owner, "n": name, "a": cur["after"], "s": cur["size"]}, toks)
+            if err == "timeout" and cur["size"] > 1:
+                cur["size"] //= 2
+                continue
+            if err:
+                raise RuntimeError(f"GraphQL {kind}: {err}")
+            conn = data["repository"][kind]
+            for node in conn["nodes"]:
+                if node:
+                    complete(node, "PullRequest" if kind == "pullRequests" else "Issue", toks)
+                    f.write(json.dumps(node) + "\n")
+            f.flush()
+            cur.update(after=conn["pageInfo"]["endCursor"], done=not conn["pageInfo"]["hasNextPage"])
+            with open(cur_path, "w") as c:
+                json.dump(cur, c)
+
+
+def gql_load():
+    """The GraphQL nodes in the REST shapes the rest of the pipeline uses."""
+    data = {"issues": [], "issue_comments": [], "pulls": [], "review_comments": [], "reviews": {}}
+    user = lambda a: {"login": a["login"]} if a and a.get("login") else None  # noqa: E731
+    api_base = f"https://api.github.com/repos/{SOURCE}"
+    for kind in ("issues", "pullRequests"):
+        nodes = {}
+        path = os.path.join(FETCH, f"gql_{kind}.jsonl")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        nd = json.loads(line)
+                        nodes[nd["number"]] = nd
+        for n, nd in sorted(nodes.items()):
+            item = {"id": nd["id"], "number": n, "title": nd.get("title"), "body": nd.get("body"),
+                    "user": user(nd.get("author")), "state": "open" if nd.get("state") == "OPEN" else "closed",
+                    "labels": [{"name": lb["name"]} for lb in ((nd.get("labels") or {}).get("nodes") or []) if lb],
+                    "created_at": nd.get("createdAt"), "updated_at": nd.get("updatedAt"), "closed_at": nd.get("closedAt")}
+            for c in (nd.get("comments") or {}).get("nodes") or []:
+                if c:
+                    data["issue_comments"].append({"id": c.get("databaseId"), "issue_url": f"{api_base}/issues/{n}",
+                                                   "body": c.get("body"), "created_at": c.get("createdAt"),
+                                                   "user": user(c.get("author"))})
+            if kind == "issues":
+                data["issues"].append(item)
+                continue
+            item["merged_at"] = nd.get("mergedAt")
+            data["pulls"].append(item)
+            reviews = []
+            for r in (nd.get("reviews") or {}).get("nodes") or []:
+                if not r:
+                    continue
+                reviews.append({"state": r.get("state"), "body": r.get("body"), "submitted_at": r.get("submittedAt"),
+                                "user": user(r.get("author"))})
+                for c in (r.get("comments") or {}).get("nodes") or []:
+                    if c:
+                        data["review_comments"].append({"id": c.get("databaseId"), "pull_request_url": f"{api_base}/pulls/{n}",
+                                                        "path": c.get("path"), "body": c.get("body"),
+                                                        "created_at": c.get("createdAt"), "user": user(c.get("author"))})
+            data["reviews"][str(n)] = reviews
+    return data
+
+
 def fetch_all(meta):
-    """PR/issue/review history of SOURCE, resumable (state/fetch/). Raises Handoff at the time budget."""
+    """PR/issue/review history of SOURCE, resumable (state/fetch/). GraphQL first (its own quota, and one call
+    brings a page of items with their comments and reviews); REST if GraphQL fails or a REST fetch was already
+    under way. Raises Handoff at the time budget."""
     os.makedirs(FETCH, exist_ok=True)
-    base = f"repos/{SOURCE}"
     toks = [TOK] + ([os.environ["READ_TOKEN"]] if os.environ.get("READ_TOKEN") and not meta.get("private") else [])
+    if os.environ.get("APP_ID") and os.environ.get("APP_KEY"):
+        try:
+            app_token()
+            toks.insert(0, "APP")  # read with the App first: the PAT's quota is kept for creating issues
+        except Exception as e:  # noqa: BLE001
+            m.log(f"  App token not available ({type(e).__name__}); reading without it")
+    owners = sorted({meta[k]["owner"]["login"] for k in ("parent", "source") if meta.get(k)})
+    if not any(f.endswith(".cursor") and not f.startswith("gql_") for f in os.listdir(FETCH)):
+        try:
+            for kind in (["issues"] if meta.get("has_issues") else []) + ["pullRequests"]:
+                gql_list(kind, toks)
+            data = gql_load()
+            data.update(errors={}, _upstream_owners=owners)
+            return data
+        except RuntimeError as e:
+            m.log(f"  GraphQL fetch failed ({str(e)[:120]}); using REST")
+    return fetch_rest(meta, toks, owners)
+
+
+def fetch_rest(meta, toks, owners):
+    base = f"repos/{SOURCE}"
     errors = {}
     for key, path, by_date in [("issues", f"{base}/issues?state=all&sort=updated&direction=asc", True),
                                ("issue_comments", f"{base}/issues/comments?sort=updated&direction=asc", True),
@@ -235,7 +439,7 @@ def fetch_all(meta):
             f.flush()
     data["reviews"] = reviews
     data["errors"] = errors
-    data["_upstream_owners"] = sorted({meta[k]["owner"]["login"] for k in ("parent", "source") if meta.get(k)})
+    data["_upstream_owners"] = owners
     return data
 
 
@@ -424,19 +628,29 @@ def import_issues():
             continue
         if time.time() - T0 > BUDGET:
             break
+        # Imports are queued in order, so one status check every 25 items (on the newest) keeps the queue short
+        # without a check per item; the failures are counted from the repo's issue total at the end.
         res, err = api("POST", f"repos/{OWNER}/{TARGET}/import/issues", payload, accept)
-        status = (res or {}).get("status")
-        while res and status == "pending":
-            time.sleep(1)
-            res, err = api("GET", f"repos/{OWNER}/{TARGET}/import/issues/{res['id']}", accept=accept)
-            status = (res or {}).get("status")
-        if status != "imported":
+        if not res:
             prog["failed"] += 1
-            m.log(f"item {i + 1} not imported ({status or 'error'})")
+            m.log(f"item {i + 1} not imported ({(err or 'error')[:80]})")
+        elif (i + 1) % 25 == 0 or i + 1 == len(todo):
+            for _ in range(60):
+                st, _ = api("GET", f"repos/{OWNER}/{TARGET}/import/issues/{res['id']}", accept=accept)
+                if (st or {}).get("status") != "pending":
+                    break
+                time.sleep(2)
+        time.sleep(0.75)  # stay under GitHub's limit of 80 created items a minute
         prog["done"] = i + 1
         with open(prog_path, "w") as f:
             json.dump(prog, f)
     more = prog["done"] < len(todo)
+    if not more:
+        got, _ = api("POST", "graphql", {"query": "query($o: String!, $n: String!) { repository(owner: $o, name: $n) "
+                                                  "{ issues { totalCount } } }", "variables": {"o": OWNER, "n": TARGET}})
+        total = (((got or {}).get("data") or {}).get("repository") or {}).get("issues", {}).get("totalCount")
+        if total is not None:
+            prog["failed"] = max(len(todo) - total, 0)
     m.log(f"issue import: {prog['done']}/{len(todo)} done, {prog['failed']} failed" + (", continuing in a new run" if more else ""))
     out("more", "true" if more else "false")
     out("next", "issues")

@@ -66,6 +66,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           READ_TOKEN: ${{ github.token }}
+          APP_ID: ${{ secrets.APP_ID }}  # optional GitHub App: its own read quota
+          APP_KEY: ${{ secrets.APP_KEY }}
           PSEUDONYM_KEY: ${{ secrets.PSEUDONYM_KEY }}
           JOB_KEY: ${{ secrets.JOB_KEY }}
           JOB: ${{ inputs.job }}
