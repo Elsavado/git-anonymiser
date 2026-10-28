@@ -507,9 +507,11 @@ def push(repo):
     head = git("symbolic-ref", "HEAD").decode().strip()
     got, err = api("POST", "user/repos", {"name": TARGET, "private": True, "has_wiki": False,
                                           "has_projects": False, "auto_init": False})
-    if err and "already exists" in err:  # a rerun after a failed issue import: reuse it if private and issue-free
+    if err and ("already exists" in err or "422" in err):  # a rerun: reuse it if private and issue-free
         got, _ = api("GET", f"repos/{OWNER}/{TARGET}")
-        if not got or got.get("open_issues_count") or api("GET", f"repos/{OWNER}/{TARGET}/issues?state=all&per_page=1")[0]:
+        if not got:
+            sys.exit(f"could not create the private repo: {err}")
+        if got or got.get("open_issues_count") or api("GET", f"repos/{OWNER}/{TARGET}/issues?state=all&per_page=1")[0]:
             sys.exit("the target repo already exists and has issues; stopping")
         m.log("reusing the existing private repo (no issues yet)")
     elif err:
@@ -677,6 +679,8 @@ def main():
     TARGET = TARGET or slug
     mask(title, slug, title.replace(" ", ""))
     if MODE == "all":
+        if os.path.exists(os.path.join(STATE, "pushed")):  # left by an earlier run: this one pushes again
+            os.remove(os.path.join(STATE, "pushed"))
         if not anonymise():
             return
         record_name(title)
