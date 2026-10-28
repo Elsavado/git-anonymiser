@@ -108,8 +108,12 @@ def placeholder(path, title):
     return ico(p) if ext == ".ico" else p
 
 
-def install(m, owner, name, homepage="", aliases=(), about="", given=""):
-    """Patch mirror.py (module m) for this repo. Returns (Anon class to use instead of m.Anon, project title, slug)."""
+def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(), keep_owner=False, owners=()):
+    """Patch mirror.py (module m) for this repo. Returns (Anon class to use instead of m.Anon, project title, slug).
+
+    names: the project names to replace, instead of the repo name (a generic repo name such as "components"
+    must not be replaced everywhere). keep_owner: the owner is also a framework the code imports (frappe,
+    angular), so its name stays. owners: other account names of the owner (old or renamed orgs) to replace."""
     title, slug, camel = project_name(m.PSEUDO.key, name, about, given)
     new_words = re.findall(r"[A-Za-z0-9]+", title)
     m.Pseudo.email = lambda self, ident: EMAIL
@@ -125,11 +129,10 @@ def install(m, owner, name, homepage="", aliases=(), about="", given=""):
         host = urlparse(x if "//" in x else "//" + x).hostname or ""
         if host:
             hosts.add(host.removeprefix("www."))
-    names = [name] + [a for a in aliases if "." not in a]
-    if owner.lower() == name.lower() or any(owner.lower() == a.lower() for a in names):
-        owner_login = None  # the owner is the project: renamed with it
-    else:
-        owner_login = owner
+    names = list(names or [name]) + [a for a in aliases if "." not in a]
+    owner_logins = [] if keep_owner else [owner]
+    owner_logins = [o for o in owner_logins + list(owners)  # an owner named like the project is renamed with it
+                    if not any(o.lower() == n.lower() for n in names + [name])]
     proj = {}
     new = spellings(new_words)
     for n in names:
@@ -146,18 +149,19 @@ def install(m, owner, name, homepage="", aliases=(), about="", given=""):
                 prose[sp] = title
     prose_re = re.compile(r"(?<![A-Za-z0-9@/._-])(?:" + "|".join(map(re.escape, sorted(prose, key=len, reverse=True)))
                           + r")(?![A-Za-z0-9_/-]|\.[A-Za-z0-9])") if prose else None
-    proj_re = re.compile("|".join(re.escape(k) for k in sorted(proj, key=len, reverse=True)))
+    proj_re = re.compile("|".join(re.escape(k) for k in sorted(proj, key=len, reverse=True)) or r"(?!)")  # (?!): never
     # Mixed spellings the styles above miss (AcmeFolio, OPEN-ledger): whole word, any case -> CamelCase.
-    loose_words = sorted({tuple(w.lower() for w in (split_words(n) or [n])) for n in names if len(n) >= 4},
+    loose_words = sorted({tuple(w.lower() for w in (split_words(n) or [n])) for n in names if len(n) >= 3},
                          key=lambda ws: len("".join(ws)), reverse=True)
     loose = ["".join(ws) for ws in loose_words]
     loose_re = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
         r"[-_ ]?".join(map(re.escape, ws)) for ws in loose_words) + r")(?![A-Za-z0-9])", re.I)
     host_re = re.compile(r"\b(?:[A-Za-z0-9-]+\.)*(?:" + "|".join(re.escape(x) for x in sorted(hosts, key=len, reverse=True))
                          + r")\b", re.I) if hosts else None
-    owner_re = re.compile(r"(?<![A-Za-z0-9-])" + re.escape(owner_login) + r"(?![A-Za-z0-9-])", re.I) if owner_login else None
-    owner_new = m.PSEUDO.login(owner_login) if owner_login else None
-    needles = [x.lower() for x in [owner, *names, *hosts] if len(x) >= 3]
+    owner_re = re.compile(r"(?<![A-Za-z0-9-])(?:" + "|".join(map(re.escape, owner_logins)) + r")(?![A-Za-z0-9-])",
+                          re.I) if owner_logins else None
+    owner_new = {o.lower(): m.PSEUDO.login(o) for o in owner_logins}
+    needles = [x.lower() for x in [*owner_logins, *names, *hosts] if len(x) >= 3]
 
     def url_fix(mt):
         u = mt.group()
@@ -168,9 +172,9 @@ def install(m, owner, name, homepage="", aliases=(), about="", given=""):
         if host_re:
             s = host_re.sub("example.com", s)
         s = proj_re.sub(lambda mt: proj[mt.group()], s)
-        s = loose_re.sub(camel, s)
+        s = loose_re.sub(lambda mt: new["lower"] if mt.group().islower() else new["UPPER"] if mt.group().isupper() else camel, s)
         if owner_re:
-            s = owner_re.sub(owner_new, s)
+            s = owner_re.sub(lambda mt: owner_new[mt.group().lower()], s)
         return s
 
     class ProjAnon(m.Anon):

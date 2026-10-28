@@ -6,6 +6,9 @@ Mode "all":
   file removed from all history, READMEs and all text anonymised by extra.py (imaginary project name, links,
   emails -> redactedemail@gmail.com) -> verification -> new private repo -> push branches and tags ->
   issue import.
+  The PR/issue history is fetched page by page into state/fetch/; a run that reaches its time budget during the
+  fetch (or has used most of its time before the rewrite) hands over to a new run instead of being stopped by
+  the 6 h job limit.
 Mode "issues": resume the issue import from state/ (a previous run that hit the time budget).
 
 Issues and pull requests are imported as issues (GitHub cannot recreate PRs) with their original, rounded
@@ -15,8 +18,10 @@ Logs carry counts only, no titles or names.
 Public repo: the job (source, name, aliases, target) arrives encrypted in JOB and is decrypted with JOB_KEY; every
 name in it is masked in the logs before anything is printed. The name record goes to a private repo (NAMES_REPO).
 
-Env: GH_TOKEN, PSEUDONYM_KEY (hex), JOB (encrypted JSON), JOB_KEY, NAMES_REPO, MODE, OWNER (target account).
-Writes state/ (api.json, progress.json) and sets the step output more=true when the import must continue.
+Env: GH_TOKEN, PSEUDONYM_KEY (hex), JOB (encrypted JSON), JOB_KEY, NAMES_REPO, MODE, OWNER (target account),
+READ_TOKEN (optional second token with its own quota, used to read a public source).
+Writes state/ (fetch/, api.json, progress.json, pushed) and sets the step outputs more=true and next=<mode>
+when a new run must continue.
 """
 import json
 import os
@@ -32,6 +37,8 @@ import mirror as m  # noqa: E402
 STATE = os.path.abspath("state")
 WORK = os.path.abspath("work")
 BUDGET = float(os.environ.get("BUDGET_MIN", "320")) * 60  # leave room under the 6 h job limit for the hand-off
+FRESH_RUN = 45 * 60  # history fetched later than this into a run: the rewrite starts in a new run
+FETCH = os.path.join(STATE, "fetch")
 T0 = time.time()
 TOK = os.environ["GH_TOKEN"]
 OWNER = os.environ["OWNER"]
@@ -58,7 +65,10 @@ SOURCE = JOB["source"].strip()
 TARGET = (JOB.get("target") or "").strip()  # empty: the project's imaginary name (set in main)
 GIVEN_NAME = (JOB.get("name") or "").strip()
 ALIASES = [a.strip() for a in (JOB.get("aliases") or "").split(",") if a.strip()]
-mask(SOURCE, *SOURCE.split("/"), TARGET, GIVEN_NAME, *ALIASES)
+NAMES = [a.strip() for a in (JOB.get("names") or "").split(",") if a.strip()]  # replace these, not the repo name
+OWNERS = [a.strip() for a in (JOB.get("owners") or "").split(",") if a.strip()]  # the owner's other accounts
+KEEP_OWNER = bool(JOB.get("keep_owner"))  # the owner is also a framework the code imports
+mask(SOURCE, *SOURCE.split("/"), TARGET, GIVEN_NAME, *ALIASES, *NAMES, *OWNERS)
 MODE = os.environ.get("MODE", "all")
 PR_LABEL, MERGED_LABEL = "pull request", "merged"
 MAX_BODY = 60000
@@ -93,20 +103,162 @@ def api(method, path, body=None, accept=None):
     return None, "gave up after repeated rate limits"
 
 
+class Handoff(Exception):
+    """This run's time is nearly used up: a new run continues from the saved state."""
+
+
+def handoff(stage):
+    m.log(f"{stage} continues in a new run (time budget)")
+    out("more", "true")
+    out("next", "all")
+    return False
+
+
+QUOTA = {}  # token -> (requests left, reset epoch)
+
+
+def pick_token(toks):
+    """A token with quota left; waits for the earliest reset, or hands off when that is past the budget."""
+    while True:
+        now = time.time()
+        for t in toks:
+            left, reset = QUOTA.get(t, (100, 0))
+            if left > 20 or reset < now:
+                return t
+        wake = min(QUOTA[t][1] for t in toks) + 30
+        if wake - T0 > BUDGET:
+            raise Handoff
+        m.log(f"  API quota used up; waiting {round((wake - now) / 60)} min for the reset")
+        time.sleep(max(wake - now, 1))
+
+
+def get(path, toks):
+    """One GET page. Returns (json, None) or (None, error); quota and transient errors are waited out."""
+    for attempt in range(1, 9):
+        t = pick_token(toks)
+        p = subprocess.run(["gh", "api", "-i", path], env=m.gh_env(t), capture_output=True)
+        head, _, body = p.stdout.replace(b"\r\n", b"\n").partition(b"\n\n")
+        lines = head.decode(errors="replace").split("\n")
+        try:
+            status = int(lines[0].split()[1])
+        except (IndexError, ValueError):
+            status = 0
+        hdr = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+        if "x-ratelimit-remaining" in hdr:
+            QUOTA[t] = (int(hdr["x-ratelimit-remaining"]), int(hdr.get("x-ratelimit-reset") or 0))
+        if status == 200:
+            return json.loads(body or b"[]"), None
+        if status in (403, 429) and (QUOTA.get(t, (1, 0))[0] == 0 or b"rate limit" in body.lower()):
+            if QUOTA.get(t, (1, 0))[0] > 0:  # secondary rate limit: back off this token for a while
+                QUOTA[t] = (0, time.time() + 60 * attempt)
+            continue
+        if status in (401, 404, 410, 422):
+            return None, str(status)
+        time.sleep(10 * attempt)  # server error or dropped connection
+    return None, "gave up"
+
+
+def fetch_list(key, path, toks, by_date):
+    """Append every page of a list to state/fetch/<key>.jsonl; the cursor lets a later run resume. Lists sorted
+    by update date restart from the last date every 250 pages (GitHub stops deep paging, e.g. at 30,000)."""
+    cur_path = os.path.join(FETCH, key + ".cursor")
+    cur = {"page": 1, "since": None, "done": False}
+    if os.path.exists(cur_path):
+        with open(cur_path) as f:
+            cur = json.load(f)
+    with open(os.path.join(FETCH, key + ".jsonl"), "a", encoding="utf-8") as f:
+        while not cur["done"]:
+            q = f"{path}&per_page=100&page={cur['page']}" + (f"&since={cur['since']}" if cur["since"] else "")
+            data, err = get(q, toks)
+            if err:
+                cur.update(done=True, error=err)
+            else:
+                for it in data:
+                    f.write(json.dumps(it) + "\n")
+                f.flush()
+                if len(data) < 100:
+                    cur["done"] = True
+                elif by_date and cur["page"] >= 250 and data[-1].get("updated_at") != cur["since"]:
+                    cur.update(page=1, since=data[-1]["updated_at"])
+                else:
+                    cur["page"] += 1
+            with open(cur_path, "w") as c:
+                json.dump(cur, c)
+    return cur.get("error")
+
+
+def load_list(key):
+    """The fetched items, once each (a resumed or date-restarted list repeats some)."""
+    by_id = {}
+    path = os.path.join(FETCH, key + ".jsonl")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    it = json.loads(line)
+                    by_id[it.get("id", len(by_id))] = it
+    return list(by_id.values())
+
+
+def fetch_all(meta):
+    """PR/issue/review history of SOURCE, resumable (state/fetch/). Raises Handoff at the time budget."""
+    os.makedirs(FETCH, exist_ok=True)
+    base = f"repos/{SOURCE}"
+    toks = [TOK] + ([os.environ["READ_TOKEN"]] if os.environ.get("READ_TOKEN") and not meta.get("private") else [])
+    errors = {}
+    for key, path, by_date in [("issues", f"{base}/issues?state=all&sort=updated&direction=asc", True),
+                               ("issue_comments", f"{base}/issues/comments?sort=updated&direction=asc", True),
+                               ("pulls", f"{base}/pulls?state=all&sort=created&direction=asc", False),
+                               ("review_comments", f"{base}/pulls/comments?sort=updated&direction=asc", True)]:
+        if key.startswith("issue") and not meta.get("has_issues"):
+            continue
+        err = fetch_list(key, path, toks, by_date)
+        if err:
+            errors[key] = err
+    data = {k: load_list(k) for k in ("issues", "issue_comments", "pulls", "review_comments")}
+    rev_path = os.path.join(FETCH, "reviews.jsonl")
+    reviews = {}
+    if os.path.exists(rev_path):
+        with open(rev_path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    r = json.loads(line)
+                    reviews[str(r["n"])] = r["r"]
+    with open(rev_path, "a", encoding="utf-8") as f:
+        for pr in data["pulls"]:
+            if str(pr["number"]) in reviews:
+                continue
+            got, err = get(f"{base}/pulls/{pr['number']}/reviews?per_page=100", toks)
+            reviews[str(pr["number"])] = got or []
+            f.write(json.dumps({"n": pr["number"], "r": got or []}) + "\n")
+            f.flush()
+    data["reviews"] = reviews
+    data["errors"] = errors
+    data["_upstream_owners"] = sorted({meta[k]["owner"]["login"] for k in ("parent", "source") if meta.get(k)})
+    return data
+
+
 def anonymise():
+    """Returns False when a new run must continue (history fetch not finished in this run's time)."""
     owner, name = SOURCE.split("/")
     meta, err = m.gh_api(f"repos/{SOURCE}", TOK)
     if err or not meta:
         sys.exit(f"source repo not readable: {err}")
     meta = meta[0]
+    try:
+        data = fetch_all(meta)
+    except Handoff:
+        return handoff("history fetch")
+    m.log("history fetched: " + ", ".join(f"{k} {len(data.get(k, []))}" for k in
+                                         ("issues", "issue_comments", "pulls", "review_comments"))
+          + (f"; {len(data['errors'])} lists not readable" if data["errors"] else ""))
+    if time.time() - T0 > FRESH_RUN:  # the rewrite of a big repo needs most of a run: start it in a fresh one
+        return handoff("rewrite")
+    data["_upstream_owners"] = sorted(set(data["_upstream_owners"]) | {owner})
     os.makedirs(WORK, exist_ok=True)
     repo = os.path.join(WORK, "repo.git")
     m.clone(owner, name, TOK, repo)
     m.log(f"cloned in {round(time.time() - T0)}s")
-    data = m.fetch_api(owner, name, TOK, meta["has_issues"])
-    data["_upstream_owners"] = sorted(set(data.get("_upstream_owners", [])) | {owner})
-    m.log("history fetched: " + ", ".join(f"{k} {len(data.get(k, []))}" for k in
-                                         ("issues", "issue_comments", "pulls", "review_comments")))
     findings = m.gitleaks(repo, os.path.join(WORK, "leaks.json"))
     raw = os.path.join(WORK, "api_raw.json")
     with open(raw, "w", encoding="utf-8") as f:
@@ -136,6 +288,7 @@ def anonymise():
     with open(os.path.join(STATE, "api.json"), "w", encoding="utf-8") as f:
         json.dump(clean, f)
     push(repo)
+    return True
 
 
 def push(repo):
@@ -191,6 +344,8 @@ def record_name(title):
     for _ in range(8):  # parallel runs: retry on a stale file version
         cur, err = api("GET", f"repos/{repo}/contents/names.csv")
         text = base64.b64decode(cur["content"]).decode() if cur else "date,original repo,imaginary name,new repo\n"
+        if f",{SOURCE}," in text:  # a rerun of a project already recorded
+            return
         body = {"message": "Record a project name", "content": base64.b64encode((text + line).encode()).decode()}
         if cur:
             body["sha"] = cur["sha"]
@@ -282,6 +437,7 @@ def import_issues():
     more = prog["done"] < len(todo)
     m.log(f"issue import: {prog['done']}/{len(todo)} done, {prog['failed']} failed" + (", continuing in a new run" if more else ""))
     out("more", "true" if more else "false")
+    out("next", "issues")
 
 
 def main():
@@ -299,11 +455,13 @@ def main():
     meta = (meta or [{}])[0]
     about = " ".join([meta.get("description") or "", " ".join(meta.get("topics") or []), name.replace("-", " ")])
     mask(meta.get("homepage") or "")
-    ANON, title, slug = extra.install(m, owner, name, meta.get("homepage") or "", ALIASES, about, GIVEN_NAME)
+    ANON, title, slug = extra.install(m, owner, name, meta.get("homepage") or "", ALIASES, about, GIVEN_NAME,
+                                      NAMES, KEEP_OWNER, OWNERS)
     TARGET = TARGET or slug
     mask(title, slug, title.replace(" ", ""))
     if MODE == "all":
-        anonymise()
+        if not anonymise():
+            return
         record_name(title)
     import_issues()
 

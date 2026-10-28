@@ -10,7 +10,7 @@ on:
         description: Encrypted job (made with the local helper)
         required: true
       mode:
-        description: all = anonymise, push and import issues; issues = continue an unfinished issue import
+        description: all = anonymise, push and import issues (resumes a paused history fetch); issues = continue an unfinished issue import
         type: choice
         options: [all, issues]
         default: all
@@ -65,6 +65,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          READ_TOKEN: ${{ github.token }}
           PSEUDONYM_KEY: ${{ secrets.PSEUDONYM_KEY }}
           JOB_KEY: ${{ secrets.JOB_KEY }}
           JOB: ${{ inputs.job }}
@@ -91,12 +92,12 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Continue the issue import
+      - name: Continue in a new run
         if: steps.anon.outcome == 'success' && steps.anon.outputs.more == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           JOB: ${{ inputs.job }}
-        run: gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=issues -f from_run="${{ github.run_id }}"
+        run: gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode="${{ steps.anon.outputs.next }}" -f from_run="${{ github.run_id }}"
 
       - name: Retry after a problem
         if: steps.anon.outcome == 'failure' && inputs.attempt != '3'
@@ -104,8 +105,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           JOB: ${{ inputs.job }}
         run: |
-          # History already pushed: only the issue import is retried, from this run's saved state.
-          if [ -f state/pushed ]; then mode=issues; from=${{ github.run_id }}; else mode=all; from=; fi
+          # History already pushed: only the issue import is retried. Either way the saved state (fetched history,
+          # import progress) carries over.
+          if [ -f state/pushed ]; then mode=issues; else mode=all; fi; from=${{ github.run_id }}
           sleep 120
           gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=$mode -f from_run="$from" -f attempt=$(( ${{ inputs.attempt }} + 1 ))
           echo "Problem in attempt ${{ inputs.attempt }}; retrying ($mode)" >> "$GITHUB_STEP_SUMMARY"
