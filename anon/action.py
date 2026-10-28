@@ -475,6 +475,7 @@ def anonymise():
     m.log(f"scan: {len(findings) + len(api_findings)} findings, {len(secrets)} secrets")
     ids = m.collect_identities(repo, data)
     ids.update({p: m.PSEUDO.name(p) for p in PEOPLE if p not in ids})  # names only found in the files
+    m.EXTRA_PEOPLE = set(PEOPLE)  # replaced in code too, even one-word names
     anon = ANON(ids)
     cmap, removed, after = m.clean_repo(repo, secrets, anon, WORK, "repo")
     m.log(f"rewritten: {len(cmap)} commits, {removed} LICENSE paths removed, {len(after)} findings left")

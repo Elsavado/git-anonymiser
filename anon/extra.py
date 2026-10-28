@@ -16,9 +16,11 @@ Every commit of the history is rewritten (the code itself is not re-authored):
 """
 import hashlib
 import hmac
+import io
 import os
 import re
 import struct
+import zipfile
 import zlib
 from urllib.parse import urlparse
 
@@ -181,7 +183,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         def __init__(self, identities):
             keep = {k: v for k, v in identities.items() if k.lower() not in {p.lower() for p in proj}}
             super().__init__(keep)
-            people = sorted({k for k in keep if " " in k.strip() and "@" not in k and len(k) >= 5}, key=len, reverse=True)
+            people = sorted({k for k in keep if (" " in k.strip() and "@" not in k and len(k) >= 5)
+                             or k in getattr(m, "EXTRA_PEOPLE", ())}, key=len, reverse=True)  # job option people
             self.people_re = re.compile(r"(?<![\w])(?:" + "|".join(r"\s+".join(map(re.escape, k.split())) for k in people)
                                         + r")(?![\w])") if people else None
             self.people = {re.sub(r"\s+", " ", k): v for k, v in keep.items() if k in people}
@@ -227,22 +230,52 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                     b = b.replace(sec, m.SECRET_MARK)
             return b
 
+        def clean_file(path, data, depth=0):
+            """One file's anonymised content (also used for the files inside zip archives)."""
+            low = path.lower()
+            if low.endswith(IMAGE_EXT) and (LOGO_RE.search(low) or loose_re.search(low) or proj_re.search(path)):
+                stats["logos"] += 1
+                return placeholder(path, title)
+            if low.endswith(".zip") and data[:2] == b"PK" and depth < 3:
+                return clean_zip(data, depth + 1)
+            if len(data) <= MAX_TEXT and b"\x00" not in data[:8000]:
+                s = data.decode("utf-8", "surrogateescape")
+                base = low.rsplit("/", 1)[-1]
+                s = anon.text(s) if (low.endswith(DOC_EXT) or base.startswith("readme")) else anon.code(s)
+                return s.encode("utf-8", "surrogateescape")
+            return data
+
+        def clean_zip(data, depth):
+            """Zip archives committed to the repo: every member renamed and anonymised like a repo file, then packed
+            again (fixed timestamps, so the same archive always gives the same result)."""
+            try:
+                src = zipfile.ZipFile(io.BytesIO(data))
+                out_buf = io.BytesIO()
+                with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+                    for info in src.infolist():
+                        name = rename(info.filename)
+                        if info.is_dir():
+                            dst.writestr(zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0)), b"")
+                            continue
+                        member = scrub(src.read(info))
+                        dst.writestr(zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0)), clean_file(name, member, depth))
+                stats["zips"] = stats.get("zips", 0) + 1
+                return out_buf.getvalue()
+            except (zipfile.BadZipFile, RuntimeError, NotImplementedError, ValueError, OSError):
+                return data  # encrypted or damaged archive: left as it is
+
         def blob_cb(blob, _meta):
             data = scrub(blob.data)
             path = paths.get(blob.original_id) if full else None
             if path is not None:
                 low = path.lower()
-                if low.endswith(IMAGE_EXT) and (LOGO_RE.search(low) or loose_re.search(low) or proj_re.search(path)):
-                    data = placeholder(path, title)
-                    stats["logos"] += 1
-                elif len(data) <= MAX_TEXT and b"\x00" not in data[:8000]:
-                    s = data.decode("utf-8", "surrogateescape")
-                    base = low.rsplit("/", 1)[-1]
-                    s = anon.text(s) if (low.endswith(DOC_EXT) or base.startswith("readme")) else anon.code(s)
-                    data = s.encode("utf-8", "surrogateescape")
-                    if not low.endswith(NO_TWEAK_EXT):
-                        data += b"\n"
-                        stats["tweaked"] += 1
+                logo = low.endswith(IMAGE_EXT) and (LOGO_RE.search(low) or loose_re.search(low) or proj_re.search(path))
+                text = (not logo and len(data) <= MAX_TEXT and b"\x00" not in data[:8000]
+                        and not (low.endswith(".zip") and data[:2] == b"PK"))
+                data = clean_file(path, data)
+                if text and not low.endswith(NO_TWEAK_EXT):
+                    data += b"\n"
+                    stats["tweaked"] += 1
             blob.data = data
 
         def filename_cb(fn):
@@ -302,7 +335,7 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         m.run(["git", "-c", "pack.threads=1", "gc", "--prune=now", "--quiet"], cwd=repo)
         if full:
             m.log(f"full pass: {stats['tweaked']} text files changed, {stats['logos']} logos/screenshots replaced, "
-                  f"{stats['renamed_paths']} paths renamed")
+                  f"{stats['renamed_paths']} paths renamed, {stats.get('zips', 0)} zip archives cleaned")
         return cmap, len(stats["licenses_removed"])
 
     m.rewrite = rewrite
