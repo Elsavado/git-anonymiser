@@ -98,17 +98,19 @@ jobs:
       # What the next run must be, kept as an artifact so watchdog.yml can start it if the hand-over below is
       # refused or lost. The job is the encrypted string the run was started with; it reveals nothing.
       - name: Note the next run
-        if: (steps.anon.outcome == 'success' && steps.anon.outputs.more == 'true') || (steps.anon.outcome == 'failure' && inputs.attempt != '3')
+        # Also when the job is stopped by the 6 h limit (cancelled): the watchdog only restarts cancelled runs that
+        # lasted that long, so a run cancelled by hand stays cancelled.
+        if: (steps.anon.outcome == 'success' && steps.anon.outputs.more == 'true') || (steps.anon.outcome == 'failure' && inputs.attempt != '3') || (cancelled() && inputs.attempt != '3')
         env:
           JOB: ${{ inputs.job }}
         run: |
           mkdir -p next-out
-          if [ "${{ steps.anon.outcome }}" = success ]; then mode="${{ steps.anon.outputs.next }}"; attempt=1
+          if [ "${{ job.status }}" != cancelled ] && [ "${{ steps.anon.outcome }}" = success ]; then mode="${{ steps.anon.outputs.next }}"; attempt=1
           else if [ -f state/pushed ]; then mode=issues; else mode=all; fi; attempt=$(( ${{ inputs.attempt }} + 1 )); fi
           printf '%s\n%s\n%s\n' "$mode" "$attempt" "$JOB" > next-out/next.txt
 
       - name: Save the next run
-        if: hashFiles('next-out/next.txt') != ''
+        if: always() && hashFiles('next-out/next.txt') != ''
         uses: actions/upload-artifact@v4
         with:
           name: next

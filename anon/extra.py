@@ -14,6 +14,7 @@ Every commit of the history is rewritten (the code itself is not re-authored):
 - logos, favicons, banners and screenshots are replaced by neutral placeholder images;
 - the whole timeline moves back by a secret offset (30-180 days; order kept, rounded to 10 minutes in UTC).
 """
+import functools
 import hashlib
 import hmac
 import io
@@ -27,6 +28,9 @@ from urllib.parse import urlparse
 EMAIL = "redactedemail@gmail.com"
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 URL_RE = re.compile(r"(?:https?://|www\.)[^\s)\]}>\"'`]+")
+WORD_RE = re.compile(r"\w+")
+AT_RUN_RE = re.compile(r"@([A-Za-z0-9-]+)")
+GH_RUN_RE = re.compile(r"github\.com/([A-Za-z0-9-]+)", re.I)
 SAFE_URL = "https://example.com"
 # The imaginary name reflects the project's topic (user, 2026-10-27): the workflow's `name` input when given,
 # otherwise a topic phrase picked from the repo's description and topics, with a qualifier from the key.
@@ -110,6 +114,62 @@ def placeholder(path, title):
     return ico(p) if ext == ".ico" else p
 
 
+_PRE = None  # (repo, paths, process, cache) for the forked workers of precompute()
+
+
+def _pre_work(oids):
+    """Worker: the new content of some blobs, written compressed to the cache; returns the unchanged ones and the
+    stats this worker added."""
+    import subprocess
+    repo, paths, process, stats, cache = _PRE
+    before = {k: v for k, v in stats.items() if isinstance(v, int)}
+    unchanged = []
+    cat = subprocess.Popen(["git", "cat-file", "--batch"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    for oid in oids:
+        cat.stdin.write(oid + b"\n")
+        cat.stdin.flush()
+        size = int(cat.stdout.readline().split()[2])
+        raw = cat.stdout.read(size)
+        cat.stdout.read(1)
+        new = process(paths[oid], raw)
+        if new == raw:
+            unchanged.append(oid)
+        else:
+            with open(os.path.join(cache, oid.decode()), "wb") as fh:
+                fh.write(zlib.compress(new, 1))
+    cat.stdin.close()
+    cat.wait()
+    return unchanged, {k: stats[k] - before.get(k, 0) for k in stats if isinstance(stats[k], int)}
+
+
+def precompute(repo, paths, process, stats):
+    """Anonymise every blob on all CPU cores before the history rewrite (which runs the blob callback on one core:
+    big histories took more than the 6 h job limit). Returns (unchanged blob ids, cache dir of the new contents);
+    the blob callback takes each result from there. Needs fork (Linux); elsewhere, or with ANON_PARALLEL=0, the
+    callback does all the work itself as before."""
+    global _PRE
+    import multiprocessing
+    import subprocess
+    import tempfile
+    n = os.cpu_count() or 1
+    if n < 2 or os.environ.get("ANON_PARALLEL") == "0" or "fork" not in multiprocessing.get_all_start_methods():
+        return set(), None
+    out = subprocess.run(["git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+                         cwd=repo, capture_output=True, check=True).stdout
+    oids = [line.split()[0] for line in out.splitlines() if line.endswith(b" blob") and line.split()[0] in paths]
+    cache = tempfile.mkdtemp(prefix="anon-cache-", dir=os.path.dirname(os.path.abspath(repo)))
+    _PRE = (repo, paths, process, stats, cache)
+    chunks = [oids[i::n * 16] for i in range(n * 16)]
+    unchanged = set()
+    with multiprocessing.get_context("fork").Pool(n) as pool:
+        for got, added in pool.imap_unordered(_pre_work, chunks):
+            unchanged.update(got)
+            for k, v in added.items():
+                stats[k] = stats.get(k, 0) + v
+    _PRE = None
+    return unchanged, cache
+
+
 def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(), keep_owner=False, owners=()):
     """Patch mirror.py (module m) for this repo. Returns (Anon class to use instead of m.Anon, project title, slug).
 
@@ -169,13 +229,27 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         u = mt.group()
         return SAFE_URL if any(n in u.lower() for n in needles) else u
 
+    # Quick checks before each regex: a file without the plain text a match must contain is skipped (most files).
+    # Case-insensitive checks use str.lower() only on ASCII text, where it agrees with re.I.
+    host_lows = [x.lower() for x in hosts]
+    loose_firsts = [ws[0] for ws in loose_words]
+    owner_lows = [o.lower() for o in owner_logins]
+
+    def may_have(s, lows):
+        if not s.isascii():
+            return True
+        low = s.lower()
+        return any(x in low for x in lows)
+
     def rename(s):
         """Project, homepage and owner names (code-safe: same style in, same style out)."""
-        if host_re:
+        if host_re and may_have(s, host_lows):
             s = host_re.sub("example.com", s)
-        s = proj_re.sub(lambda mt: proj[mt.group()], s)
-        s = loose_re.sub(lambda mt: new["lower"] if mt.group().islower() else new["UPPER"] if mt.group().isupper() else camel, s)
-        if owner_re:
+        if any(k in s for k in proj):
+            s = proj_re.sub(lambda mt: proj[mt.group()], s)
+        if may_have(s, loose_firsts):
+            s = loose_re.sub(lambda mt: new["lower"] if mt.group().islower() else new["UPPER"] if mt.group().isupper() else camel, s)
+        if owner_re and may_have(s, owner_lows):
             s = owner_re.sub(lambda mt: owner_new[mt.group().lower()], s)
         return s
 
@@ -185,30 +259,75 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             super().__init__(keep)
             people = sorted({k for k in keep if (" " in k.strip() and "@" not in k and len(k) >= 5)
                              or k in getattr(m, "EXTRA_PEOPLE", ())}, key=len, reverse=True)  # job option people
-            self.people_re = re.compile(r"(?<![\w])(?:" + "|".join(r"\s+".join(map(re.escape, k.split())) for k in people)
-                                        + r")(?![\w])") if people else None
+            # One regex over thousands of names is slow on big files (ghostfolio: 0.5 MB/s, too slow for 4 GB of
+            # history), so each file only gets a regex of the names that can occur in it, same order as before.
+            self.people_list = people
+            self.people_first = {}  # first word -> indexes into people (None: not a plain word, always tried)
+            for i, k in enumerate(people):
+                w = k.split()[0]
+                self.people_first.setdefault(w if re.fullmatch(r"\w+", w) else None, []).append(i)
             self.people = {re.sub(r"\s+", " ", k): v for k, v in keep.items() if k in people}
             logins = sorted({k for k in keep if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{2,38}", k)}, key=len, reverse=True)
-            self.login_re = re.compile(r"(?<=@)(?:" + "|".join(map(re.escape, logins)) + r")\b|(?<=github\.com/)(?:"
-                                       + "|".join(map(re.escape, logins)) + r")\b", re.I) if logins else None
+            self.login_list = logins
+            self.login_index = {}
+            for i, k in enumerate(logins):
+                self.login_index.setdefault(k.lower(), []).append(i)
             self.logins = {k.lower(): v for k, v in keep.items() if k in logins}
+
+        @staticmethod
+        @functools.lru_cache(maxsize=4096)
+        def _people_re(people):
+            # Same as (?<![\w])(?:A|B), but each name starts with its literal first character, so the regex engine
+            # can jump to the places where a name may start; the look-behind then checks the character before it.
+            def one(k):
+                p = r"\s+".join(map(re.escape, k.split()))
+                c = re.escape(k.split()[0][0])
+                return c + r"(?<![\w][\s\S])" + p[len(c):]
+            return re.compile("(?:" + "|".join(map(one, people)) + r")(?![\w])")
+
+        @staticmethod
+        @functools.lru_cache(maxsize=4096)
+        def _login_re(logins):
+            alt = "|".join(map(re.escape, logins))
+            return re.compile(r"(?<=@)(?:" + alt + r")\b|(?<=github\.com/)(?:" + alt + r")\b", re.I)
+
+        def people_in(self, s):
+            idx = list(self.people_first.get(None, ()))
+            for w in set(WORD_RE.findall(s)) & self.people_first.keys():
+                idx += self.people_first[w]
+            return tuple(self.people_list[i] for i in sorted(idx))
+
+        def logins_in(self, s):
+            idx = set()
+            runs = AT_RUN_RE.findall(s) if "@" in s else []
+            if may_have(s, ["github.com/"]):
+                runs += GH_RUN_RE.findall(s)
+            for t in runs:  # a login is a prefix of the run of login characters after @ or github.com/
+                t = t.lower()
+                for n in range(3, min(len(t), 39) + 1):
+                    idx.update(self.login_index.get(t[:n], ()))
+            return tuple(self.login_list[i] for i in sorted(idx))
 
         def code(self, s):
             """Code-safe replacements for any text file."""
-            s = EMAIL_RE.sub(EMAIL, s)
+            if "@" in s:
+                s = EMAIL_RE.sub(EMAIL, s)
             s = rename(s)
-            if self.login_re:
-                s = self.login_re.sub(lambda mt: self.logins.get(mt.group().lower(), mt.group()), s)
-            if self.people_re:
-                s = self.people_re.sub(lambda mt: self.people.get(re.sub(r"\s+", " ", mt.group()), mt.group()), s)
+            logins = self.logins_in(s)
+            if logins:
+                s = self._login_re(logins).sub(lambda mt: self.logins.get(mt.group().lower(), mt.group()), s)
+            people = self.people_in(s)
+            if people:
+                s = self._people_re(people).sub(lambda mt: self.people.get(re.sub(r"\s+", " ", mt.group()), mt.group()), s)
             return s
 
         def text(self, s):
             """Docs, messages and issues: also links naming the project and every known identity."""
-            s = URL_RE.sub(url_fix, s)
-            if host_re:
+            if "://" in s or "www." in s:
+                s = URL_RE.sub(url_fix, s)
+            if host_re and may_have(s, host_lows):
                 s = host_re.sub("example.com", s)
-            if prose_re:
+            if prose_re and any(k in s for k in prose):
                 s = prose_re.sub(title, s)
             return super().text(self.code(s))
 
@@ -264,9 +383,9 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             except (zipfile.BadZipFile, RuntimeError, NotImplementedError, ValueError, OSError):
                 return data  # encrypted or damaged archive: left as it is
 
-        def blob_cb(blob, _meta):
-            data = scrub(blob.data)
-            path = paths.get(blob.original_id) if full else None
+        def process(path, data):
+            """A blob's new content (path: one path it appears at, None when not known)."""
+            data = scrub(data)
             if path is not None:
                 low = path.lower()
                 logo = low.endswith(IMAGE_EXT) and (LOGO_RE.search(low) or loose_re.search(low) or proj_re.search(path))
@@ -276,7 +395,22 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 if text and not low.endswith(NO_TWEAK_EXT):
                     data += b"\n"
                     stats["tweaked"] += 1
-            blob.data = data
+            return data
+
+        same, cache = precompute(repo, paths, process, stats) if full else (set(), None)
+
+        def blob_cb(blob, _meta):
+            oid = blob.original_id
+            if oid in same:
+                return
+            if cache:
+                f = os.path.join(cache, oid.decode())
+                if os.path.exists(f):
+                    with open(f, "rb") as fh:
+                        blob.data = zlib.decompress(fh.read())
+                    os.remove(f)
+                    return
+            blob.data = process(paths.get(oid) if full else None, blob.data)
 
         def filename_cb(fn):
             parts = fn.split(b"/")
@@ -327,6 +461,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 old, new_id = line.split()
                 cmap[old] = new_id
         m.rmtree(os.path.join(repo, "filter-repo"))
+        if cache:
+            m.rmtree(cache)
         m.subprocess.run(["git", "config", "--remove-section", "remote.origin"], cwd=repo, capture_output=True)
         for junk in ("FETCH_HEAD", "ORIG_HEAD", "logs"):
             p = os.path.join(repo, junk)

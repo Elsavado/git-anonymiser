@@ -1,0 +1,29 @@
+name: Self-test
+
+# Checks that the parallel blob step gives exactly the same history as the one-core rewrite (anon/selftest.py).
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Public repo to rewrite twice (owner/name)
+        required: true
+        default: pallets/click
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: pip install --quiet git-filter-repo==2.47.0
+      - name: Rewrite twice and compare
+        env:
+          PYTHONUTF8: '1'
+        run: python -I anon/selftest.py "${{ inputs.repo }}"

@@ -1,7 +1,8 @@
 name: Watchdog
 
 # Restarts any anonymisation chain whose hand-over was lost: a finished run that left a "next" artifact (it had
-# more to do, or hit a problem with retries left) but no run was started from it. The new run continues from
+# more to do, hit a problem with retries left, or was stopped by the 6 h job limit) but no run was started from it.
+# Cancelled runs count only when they lasted about 6 h (the limit), never when cancelled by hand. The new run continues from
 # that run's saved state, so nothing is redone from scratch. Set the repo variable WATCHDOG to "off" to pause.
 on:
   schedule:
@@ -34,7 +35,8 @@ jobs:
           runs="repos/$R/actions/workflows/anonymise.yml/runs?created=>$(date -u -d '-6 days' +%F)&per_page=100"
           gh api --paginate "$runs" -q '.workflow_runs[].display_title' > titles.txt
           gh api --paginate "$runs&status=completed" \
-            -q ".workflow_runs[]|select(.updated_at > \"$since\" and .updated_at < \"$settle\")|.id" > done.txt
+            -q ".workflow_runs[]|select(.updated_at > \"$since\" and .updated_at < \"$settle\")
+                 |select(.conclusion != \"cancelled\" or ((.updated_at|fromdate) - (.run_started_at|fromdate)) >= 20400)|.id" > done.txt
           restarted=0
           for id in $(cat done.txt); do
             grep -q ", from $id)" titles.txt && continue  # its successor exists
