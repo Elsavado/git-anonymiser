@@ -112,8 +112,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
     """Patch mirror.py (module m) for this repo. Returns (Anon class to use instead of m.Anon, project title, slug).
 
     names: the project names to replace, instead of the repo name (a generic repo name such as "components"
-    must not be replaced everywhere). keep_owner: the owner is also a framework the code imports (frappe,
-    angular), so its name stays. owners: other account names of the owner (old or renamed orgs) to replace."""
+    must not be replaced everywhere). keep_owner: the owner is also a framework the code imports, so its
+    name stays. owners: other account names of the owner (old or renamed orgs) to replace."""
     title, slug, camel = project_name(m.PSEUDO.key, name, about, given)
     new_words = re.findall(r"[A-Za-z0-9]+", title)
     m.Pseudo.email = lambda self, ident: EMAIL
