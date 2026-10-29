@@ -38,6 +38,7 @@ STEP = os.environ.get("STEP", "rewrite")
 STATE = os.path.abspath("state")
 WORK = os.path.abspath("work")
 GAP, PER_HOUR = 3.5, 450  # issue edits: GitHub's content-creation limits, with room for other jobs
+ONLY_PRS = os.environ.get("ONLY_PRS") == "true"  # edit only the imported pull requests (label "pull request")
 
 SAFE_HOME = {"user", "username", "runner", "root", "admin", "ubuntu", "me", "you", "yourname", "your-name", "name",
              "shared", "public", "default", "home", "vagrant", "docker", "node", "app", "jenkins", "travis", "circleci",
@@ -375,7 +376,7 @@ def audit_history(R, repo):
 
 GQL_ISSUES = """query($o:String!,$n:String!,$c:String){repository(owner:$o,name:$n){issues(first:50,after:$c,
 orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor} nodes{id number title body
-comments(first:100){totalCount pageInfo{endCursor} nodes{id body}}}}}}"""
+labels(first:20){nodes{name}} comments(first:100){totalCount pageInfo{endCursor} nodes{id body}}}}}}"""
 GQL_MORE = """query($o:String!,$n:String!,$i:Int!,$c:String){repository(owner:$o,name:$n){issue(number:$i){
 comments(first:100,after:$c){pageInfo{hasNextPage endCursor} nodes{id body}}}}}"""
 
@@ -552,6 +553,8 @@ def step_issues(R):
             out("next", "issues")
             return
         if x["number"] in done:
+            continue
+        if ONLY_PRS and "pull request" not in [lb["name"] for lb in x["labels"]["nodes"]]:
             continue
         upd = {}
         for k in ("title", "body"):

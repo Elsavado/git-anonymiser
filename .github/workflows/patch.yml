@@ -62,6 +62,7 @@ jobs:
           STEP: ${{ inputs.step }}
           OWNER: ${{ github.repository_owner }}
           PYTHONUTF8: '1'
+          ONLY_PRS: 'true'  # user 2026-10-29: pull requests first, plain issues left as they are
         run: |
           gh auth setup-git
           python -I anon/patch.py
