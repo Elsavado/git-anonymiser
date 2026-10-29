@@ -63,6 +63,16 @@ def check_email():
     print("email: 100000 random strings same as the regex, long run fast", flush=True)
 
 
+def check_proj():
+    cases = [("llm-d", "use llm-d here", True), ("llm-d", "vllm-dev", False), ("llm-d", "llm-dx", False),
+             ("llm-d", "llm-d-sim", True), ("LLM_D", "LLM_DIR", False), ("AcmeDB", "AcmeDBConfig", True),
+             ("AcmeDB", "AcmeDBs", False), ("acme_db", "acme_db_test", True)]
+    for k, text, hit in cases:
+        if bool(re.search(extra.proj_word(k), text)) != hit:
+            return f"project word {k!r} in {text!r}: expected {'a' if hit else 'no'} match"
+    print("project words: whole-word matching ok", flush=True)
+
+
 def check_twins(work, anon):
     """Two commits on the same parent, 1 s apart from two e-mails, must stay two commits after rounding."""
     repo = os.path.join(work, "twins.git")
@@ -121,7 +131,7 @@ def main(source):
         print("IDENTICAL" if not problem else "PROBLEMS: " + problem)
         return 0 if not problem else 1
     owner, name = source.split("/")
-    problems = [p for p in (check_timeout(), check_email()) if p]
+    problems = [p for p in (check_timeout(), check_email(), check_proj()) if p]
     work = tempfile.mkdtemp()
     m.PSEUDO = m.Pseudo(os.path.join(work, "key"))
     anon_cls, _, _ = extra.install(m, owner, name)

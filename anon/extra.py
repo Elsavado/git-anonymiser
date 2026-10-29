@@ -342,6 +342,13 @@ def shape_problems(before, repo, cmap):
     return problems
 
 
+def proj_word(k):
+    """An exact project spelling as a word: not inside a longer name (llm-d is not replaced in vllm-dev or llm-dx).
+    A CamelCase spelling may still start a longer CamelCase name (AcmeDBConfig)."""
+    camel = re.search(r"[a-z]", k) and re.search(r"[A-Z]", k)
+    return r"(?<![A-Za-z0-9])" + re.escape(k) + (r"(?![a-z0-9])" if camel else r"(?![A-Za-z0-9])")
+
+
 def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(), keep_owner=False, owners=()):
     """Patch mirror.py (module m) for this repo. Returns (Anon class to use instead of m.Anon, project title, slug).
 
@@ -385,7 +392,7 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 prose[sp] = title
     prose_re = re.compile(r"(?<![A-Za-z0-9@/._-])(?:" + "|".join(map(re.escape, sorted(prose, key=len, reverse=True)))
                           + r")(?![A-Za-z0-9_/-]|\.[A-Za-z0-9])") if prose else None
-    proj_re = re.compile("|".join(re.escape(k) for k in sorted(proj, key=len, reverse=True)) or r"(?!)")  # (?!): never
+    proj_re = re.compile("|".join(map(proj_word, sorted(proj, key=len, reverse=True))) or r"(?!)")  # (?!): never
     # Mixed spellings the styles above miss (AcmeFolio, OPEN-ledger): whole word, any case -> CamelCase.
     loose_words = sorted({tuple(w.lower() for w in (split_words(n) or [n])) for n in names if len(n) >= 3},
                          key=lambda ws: len("".join(ws)), reverse=True)
