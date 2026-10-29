@@ -241,6 +241,30 @@ def quiet(fn):
         os.close(null)
 
 
+def path_map(repo, R):
+    """Old path -> new path for every path the rules change. A new path that another path in the history already
+    has (or that two changed paths would share) gets -2, -3 ... on its file name, so no rename collides."""
+    out = subprocess.run(["git", "-C", repo, "log", "--all", "--no-renames", "--diff-merges=first-parent",
+                          "--name-only", "--format=", "-z"], check=True, capture_output=True).stdout
+    every = sorted({p for p in out.split(b"\0") if p})
+    taken, res = set(every), {}
+    for fn in every:
+        s = fn.decode("utf-8", "surrogateescape")
+        n = R.apply(s)
+        if n == s:
+            continue
+        cand, k = n, 1
+        while cand.encode("utf-8", "surrogateescape") in taken:
+            k += 1
+            d, _, b = n.rpartition("/")
+            stem, dot, ext = b.partition(".") if not b.startswith(".") else (b, "", "")
+            cand = (d + "/" if d else "") + f"{stem}-{k}" + (dot + ext if dot else "")
+        e = cand.encode("utf-8", "surrogateescape")
+        taken.add(e)
+        res[fn] = e
+    return res
+
+
 def rewrite(R):
     import git_filter_repo as fr
     repo = os.path.join(WORK, "repo.git")
@@ -264,12 +288,13 @@ def rewrite(R):
             blob.data = n.encode("utf-8", "surrogateescape")
             st["blobs_changed"] += 1
 
+    paths = path_map(repo, R)
+
     def filename_cb(fn):
-        s = fn.decode("utf-8", "surrogateescape")
-        n = R.apply(s)
-        if n != s:
+        n = paths.get(fn)
+        if n is not None:
             st["paths_renamed"] += 1
-            return n.encode("utf-8", "surrogateescape")
+            return n
         return fn
 
     def refname_cb(ref):
