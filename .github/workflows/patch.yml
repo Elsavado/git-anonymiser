@@ -1,0 +1,99 @@
+name: Patch anonymised repo
+
+# Replaces leftover strings in an already-anonymised private repo, in place (anon/patch.py). The rules hold real
+# names: they are read at run time from the private names repo and masked at once; the log shows counts only and
+# the saved state is encrypted (JOB_KEY). The default step only rewrites and checks; pushing is a separate,
+# explicit dispatch (step: push), which then continues with the paced issue edits on its own.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Anonymised repo to patch (name only, in this account)
+        required: true
+      step:
+        description: rewrite = rewrite and check only (no push); push = force-push a verified rewrite, then issues; issues = continue the issue edits
+        type: choice
+        options: [rewrite, push, issues]
+        default: rewrite
+      from_run:
+        description: run whose saved state this one continues (push - the verified rewrite run; issues - the previous run)
+        required: false
+        default: ''
+
+run-name: Patch ${{ inputs.target }} (${{ inputs.step }}${{ inputs.from_run != '' && format(', from {0}', inputs.from_run) || '' }})
+
+permissions:
+  contents: read
+  actions: write  # the issue edits continue in a new run
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: inputs.step != 'issues'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h / | tail -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install --quiet git-filter-repo==2.47.0
+
+      - name: Restore state
+        if: inputs.from_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_KEY: ${{ secrets.JOB_KEY }}
+        run: |
+          gh run download "${{ inputs.from_run }}" -n patch-state -D enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:JOB_KEY -in enc/state.enc | tar -xz
+
+      - name: Patch
+        id: patch
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          NAMES_REPO: ${{ secrets.NAMES_REPO }}
+          TARGET: ${{ inputs.target }}
+          STEP: ${{ inputs.step }}
+          OWNER: ${{ github.repository_owner }}
+          PYTHONUTF8: '1'
+        run: |
+          gh auth setup-git
+          python -I anon/patch.py
+
+      - name: Encrypt state
+        if: always()
+        env:
+          JOB_KEY: ${{ secrets.JOB_KEY }}
+        run: |
+          mkdir -p enc-out
+          if [ -d state ]; then tar -cz state | openssl enc -aes-256-cbc -pbkdf2 -pass env:JOB_KEY -out enc-out/state.enc; fi
+
+      - name: Save state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-state
+          path: enc-out/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Continue in a new run
+        if: steps.patch.outputs.more == 'true'
+        continue-on-error: true
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            for t in "$OWN" "$PAT"; do
+              GH_TOKEN=$t gh workflow run patch.yml -R "${{ github.repository }}" -f target="${{ inputs.target }}" -f step="${{ steps.patch.outputs.next }}" -f from_run="${{ github.run_id }}" && exit 0
+            done
+            sleep $(( i * 30 ))
+          done
+          echo "COULD NOT START THE NEXT RUN - continue with step issues from run ${{ github.run_id }}" | tee -a "$GITHUB_STEP_SUMMARY"
