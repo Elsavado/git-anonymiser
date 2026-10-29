@@ -185,11 +185,9 @@ def ico(p):
 
 def placeholder(path, title):
     ext = os.path.splitext(path.lower())[1]
-    if ext == ".svg":
-        initials = "".join(w[0] for w in title.split()[:3]).upper()
-        return (f'<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
-                f'<rect width="256" height="256" rx="40" fill="#B8BEC6"/><text x="128" y="150" font-size="72" '
-                f'font-family="sans-serif" text-anchor="middle" fill="#ffffff">{initials}</text></svg>\n').encode()
+    if ext == ".svg":  # no text: the imaginary title's initials can spell the original acronym
+        return (b'<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
+                b'<rect width="256" height="256" rx="40" fill="#B8BEC6"/></svg>\n')
     p = png(64 if ext in (".ico", ".icns") else 256)
     return ico(p) if ext == ".ico" else p
 
