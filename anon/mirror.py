@@ -41,7 +41,8 @@ SALT = os.urandom(16)  # for commit hashes the rewrite cannot map; never stored
 STOP = {"root", "admin", "user", "test", "github", "git", "none", "unknown", "localhost",
         "ubuntu", "travis", "runner", "build", "main", "master", "dev", "the", "and",
         "for", "web", "app", "api", "bot", "ci", "server", "system", "info", "contact",
-        "support", "noreply", "users", "example", "docs", "readme", "license", "github actions"}
+        "support", "noreply", "users", "example", "docs", "readme", "license", "github actions",
+        "ghost"}  # ghost: GitHub's account for deleted users
 LICENSE_RE = re.compile(rb"^(licen[cs]e|copying|unlicense|copyright)([._\-].*)?$", re.I)
 TOKEN_RE = re.compile(r"\w[\w.+\-@]*\w|\w")
 SHA40 = re.compile(r"\b[0-9a-f]{40}\b")

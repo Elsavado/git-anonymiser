@@ -54,6 +54,9 @@ def email_sub(repl, s):
 URL_RE = re.compile(r"(?:https?://|www\.)[^\s)\]}>\"'`]+")
 WORD_RE = re.compile(r"\w+")
 AT_RUN_RE = re.compile(r"@([A-Za-z0-9-]+)")
+MERGE_PR_RE = re.compile(r"(Merge pull request #\d+ from )([A-Za-z0-9][A-Za-z0-9-]{0,38})/([^\s'\"]+)")
+MERGE_BR_RE = re.compile(r"(Merge (?:remote-tracking )?branch '(?:[^'/\s]+/)?)([^'\s]+)(')")
+TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK|NOTE)\(([A-Za-z0-9][A-Za-z0-9_.-]{1,38})\)")
 GH_RUN_RE = re.compile(r"github\.com/([A-Za-z0-9-]+)", re.I)
 SAFE_URL = "https://example.com"
 # The imaginary name reflects the project's topic (user, 2026-10-27): the workflow's `name` input when given,
@@ -81,6 +84,59 @@ LOGO_RE = re.compile(r"logo|brand|favicon|wordmark|banner|mascot|apple-touch|og-
 DOC_EXT = (".md", ".mdx", ".markdown", ".rst", ".adoc", ".txt", ".html", ".htm")
 NO_TWEAK_EXT = (".snap", ".golden", ".patch", ".diff", ".pem", ".crt", ".key", ".der", ".sig", ".asc", ".sum")
 MAX_TEXT = 20 * 2**20
+# Metadata and translation files list people by login or one-word name ("login": "x", reviewers: - x, Last-Translator:
+# x <...>, translator-credits): they get every known identity replaced, like docs, not only @login and full names.
+STRUCT_RE = re.compile(r"(^|/)(\.all-contributorsrc|\.pullapprove\.ya?ml|codeowners|funding\.ya?ml|citation\.cff|"
+                       r"\.zenodo\.json|\.mailmap|dependabot\.ya?ml|renovate\.json5?|(authors|contributors|maintainers|"
+                       r"credits|owners)(\.[a-z]+)?)$|\.(po|pot|xlf|xliff|cff)$|(^|/)\.github/.*\.(json|ya?ml)$", re.I)
+# A name that is also a common English word ("page", "ghost", "contributor") is replaced only where it stands for a
+# person (@x, github.com/x, merge lines, TODO(x), ref names, metadata files), never on its own in prose or code.
+COMMON_FALLBACK = set("""
+able about above access account action active add address admin advanced after again agent all alpha also alter
+amber angel answer anything apple april area army art artist autumn avatar back badge baker bank base basic bear
+beta bird black blank block blue board body book boss bot box brain branch brand bridge bright brown build builder
+bunny butter button cache call camp candy cap captain card care carpet case cash cat chain change chaos charlie
+chart check cherry chief child city class clean clear client clock cloud coach code coder coffee cold color
+comment common config contact content contrib contributor cook cool copper core corner cosmos count cover craft
+crash cream creator crow crystal cube cyber daily dancer dark data dawn day deal debug deep delta demo design
+designer desk dev developer devil diamond digital doc docs doctor dog dragon dream drive duck dust eagle earth east
+echo edge editor eight element empty end energy engine engineer error event example expert eye face factory falcon
+fan farm fast father feature field file final fire first fish fix flash flow flower fly focus forest fox frame free
+friend frost fun game garden gate ghost giant gift glass global gold good grace green grey guest guide hacker hand
+happy hawk heart hello help hero hill home honey hope host hunter ice idea image info iron island jack jade jazz
+job joker joy judge jungle just king kit knight lab lady lake lamp last leader lemon level light lime line link lion
+little local logic long lord love lucky lunar magic mail main maker man manager map maple mark market master matrix
+max media mellow member mercury meta metal micro mind mint mirror mobile mode model money monkey moon morning
+mother motion mountain mouse music native nature new news night ninja noble node north nova ocean office omega one
+open orange order origin owner page paper park pass patch peace pearl pencil pepper phoenix pilot pink pixel plain
+planet player plus point polar post power prime prince pro project proxy pulse pure purple quantum queen quick
+rabbit rain random raven ready red release remote rich river robot rock rocket root rose ruby runner sage sailor
+salt sand scout sea search season secret security seed server shadow shark sharp shell shine silver simple sky
+smart smile smith snake snow solar solid sound south space spark spider spirit spring square star steel stone
+storm story studio sugar summer sun super swift system tango team tech test thunder tiger time tiny titan token
+tool top tower trade tree true trust twin ultra union unit unknown user valley vector velvet victor viper vision
+voice void walker wall water wave west white wild wind winter wizard wolf wood work world writer yellow young zero
+""".split())
+
+
+def _common_words():
+    words = set(COMMON_FALLBACK)
+    for p in ("/usr/share/dict/words", "/usr/share/dict/american-english"):
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                words |= {w for w in (x.strip() for x in f) if len(w) >= 3 and w.isalpha() and w.islower()}
+            break
+        except OSError:
+            pass
+    return words
+
+
+COMMON = _common_words()
+
+
+def plain_word(k):
+    """An identity that is also an ordinary word: lower case or Capitalised, and in the word list."""
+    return k.isascii() and k.isalpha() and k.lower() in COMMON and (k.islower() or k[1:].islower())
 
 
 def project_name(key, name, about="", given=""):
@@ -319,6 +375,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         for style, sp in old.items():
             if len(sp) >= 4 and sp not in proj:
                 proj[sp] = new[style]
+    for sp in [k for k in proj if "_" in k]:  # Markdown escapes underscores: name\_part
+        proj.setdefault(sp.replace("_", "\\_"), proj[sp].replace("_", "\\_"))
     # In prose (docs, messages, issues) a capitalised one-word name reads as the spaced title.
     prose = {}
     for n in names:
@@ -333,11 +391,22 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                          key=lambda ws: len("".join(ws)), reverse=True)
     loose = ["".join(ws) for ws in loose_words]
     loose_re = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
-        r"[-_ ]?".join(map(re.escape, ws)) for ws in loose_words) + r")(?![A-Za-z0-9])", re.I)
+        r"(?:\\?[-_]| )?".join(map(re.escape, ws)) for ws in loose_words) + r")(?![A-Za-z0-9])", re.I)
+    # CamelCase joins (AcmeDriver, FooAcmeError): a one-word name that is not an ordinary word, as a part of a name.
+    camel_parts = sorted({ws[0][:1].upper() + ws[0][1:] for ws in loose_words
+                          if len(ws) == 1 and len(ws[0]) >= 3 and not plain_word(ws[0])}, key=len, reverse=True)
+    camel_alt = "|".join(map(re.escape, camel_parts))
+    camel_re = re.compile(r"(?<![A-Za-z])(?:" + camel_alt + r")(?=[A-Z][a-z])|(?<=[a-z0-9])(?:" + camel_alt +
+                          r")(?![a-z])") if camel_parts else None
     host_re = re.compile(r"\b(?:[A-Za-z0-9-]+\.)*(?:" + "|".join(re.escape(x) for x in sorted(hosts, key=len, reverse=True))
                          + r")\b", re.I) if hosts else None
-    owner_re = re.compile(r"(?<![A-Za-z0-9-])(?:" + "|".join(map(re.escape, owner_logins)) + r")(?![A-Za-z0-9-])",
-                          re.I) if owner_logins else None
+    rev_hosts = sorted({".".join(reversed(x.split("."))) for x in hosts if "." in x}, key=len, reverse=True)
+    # reverse-DNS ids: io.acme.app -> com.example.app
+    rev_re = re.compile(r"(?<![\w.-])(?:" + "|".join(map(re.escape, rev_hosts)) + r")\b(?!-)", re.I) if rev_hosts else None
+    # Owner logins joined with a hyphen (bot accounts acme-release[bot], forks f-acme) too, unless the owner is a word.
+    owner_re = re.compile("|".join(
+        (r"(?<![A-Za-z0-9-])" if plain_word(o) else r"(?<![A-Za-z0-9])") + re.escape(o) +
+        (r"(?![A-Za-z0-9-])" if plain_word(o) else r"(?![A-Za-z0-9])") for o in owner_logins), re.I) if owner_logins else None
     owner_new = {o.lower(): m.PSEUDO.login(o) for o in owner_logins}
     needles = [x.lower() for x in [*owner_logins, *names, *hosts] if len(x) >= 3]
 
@@ -350,6 +419,7 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
     host_lows = [x.lower() for x in hosts]
     loose_firsts = [ws[0] for ws in loose_words]
     owner_lows = [o.lower() for o in owner_logins]
+    rev_firsts = [x.lower() for x in rev_hosts]
 
     def may_have(s, lows):
         if not s.isascii():
@@ -367,12 +437,20 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             s = loose_re.sub(lambda mt: new["lower"] if mt.group().islower() else new["UPPER"] if mt.group().isupper() else camel, s)
         if owner_re and may_have(s, owner_lows):
             s = owner_re.sub(lambda mt: owner_new[mt.group().lower()], s)
+        if rev_re and may_have(s, rev_firsts):
+            s = rev_re.sub("com.example", s)
+        if camel_re and any(p in s for p in camel_parts):
+            s = camel_re.sub(camel, s)
         return s
 
     class ProjAnon(m.Anon):
         def __init__(self, identities):
             keep = {k: v for k, v in identities.items() if k.lower() not in {p.lower() for p in proj}}
-            super().__init__(keep)
+            extra_people = getattr(m, "EXTRA_PEOPLE", ())
+            # Ordinary words that are also someone's login or e-mail name stay as words in prose (no "at <person>
+            # boundaries" for "at page boundaries"); they are still replaced where they stand for a person.
+            self.plain = {k.lower(): v for k, v in keep.items() if plain_word(k) and k not in extra_people}
+            super().__init__({k: v for k, v in keep.items() if k.lower() not in self.plain})
             people = sorted({k for k in keep if (" " in k.strip() and "@" not in k and len(k) >= 5)
                              or k in getattr(m, "EXTRA_PEOPLE", ())}, key=len, reverse=True)  # job option people
             # One regex over thousands of names is slow on big files (ghostfolio: 0.5 MB/s, too slow for 4 GB of
@@ -384,6 +462,7 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 self.people_first.setdefault(w if re.fullmatch(r"\w+", w) else None, []).append(i)
             self.people = {re.sub(r"\s+", " ", k): v for k, v in keep.items() if k in people}
             logins = sorted({k for k in keep if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{2,38}", k)}, key=len, reverse=True)
+            self.all_logins = {k.lower(): v for k, v in keep.items() if k in logins}  # plain words included
             self.login_list = logins
             self.login_index = {}
             for i, k in enumerate(logins):
@@ -424,18 +503,60 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                     idx.update(self.login_index.get(t[:n], ()))
             return tuple(self.login_list[i] for i in sorted(idx))
 
+        def who(self, w):
+            """The replacement of a login or one-word name, or None."""
+            low = w.lower()
+            return self.all_logins.get(low) or self.plain.get(low)
+
+        def branch(self, b):
+            """A branch name with the logins in it replaced (login/topic, login-patch-1, topic/login)."""
+            out = []
+            for seg in b.split("/"):
+                r = self.who(seg)
+                if r:
+                    seg = r
+                else:
+                    for i in [j for j, ch in enumerate(seg) if ch in "-_"][::-1]:  # longest login prefix first
+                        head = seg[:i]
+                        r = None if plain_word(head) else self.all_logins.get(head.lower())
+                        if r:
+                            seg = r + seg[i:]
+                            break
+                out.append(seg)
+            return rename("/".join(out))
+
+        def ref(self, r):
+            for pre in ("refs/heads/", "refs/tags/"):
+                if r.startswith(pre):
+                    return pre + self.branch(r[len(pre):])
+            return rename(r)
+
+        def contexts(self, s):
+            """Places where a word stands for a person: merge lines (with their branch names) and TODO(x)."""
+            if "Merge " in s:
+                s = MERGE_PR_RE.sub(lambda mt: mt.group(1) + (self.who(mt.group(2)) or mt.group(2)) + "/" +
+                                    self.branch(mt.group(3)), s)
+                s = MERGE_BR_RE.sub(lambda mt: mt.group(1) + self.branch(mt.group(2)) + mt.group(3), s)
+            if "(" in s:
+                s = TODO_RE.sub(lambda mt: mt.group(1) + "(" + (self.who(mt.group(2)) or mt.group(2)) + ")", s)
+            return s
+
         def code(self, s):
             """Code-safe replacements for any text file."""
             if "@" in s:
                 s = email_sub(EMAIL, s)
-            s = rename(s)
+            s = self.contexts(rename(s))
             logins = self.logins_in(s)
             if logins:
-                s = self._login_re(logins).sub(lambda mt: self.logins.get(mt.group().lower(), mt.group()), s)
+                s = self._login_re(logins).sub(lambda mt: self.who(mt.group()) or mt.group(), s)
             people = self.people_in(s)
             if people:
                 s = self._people_re(people).sub(lambda mt: self.people.get(re.sub(r"\s+", " ", mt.group()), mt.group()), s)
             return s
+
+        def meta(self, s):
+            """Metadata and translation files: code-safe, plus every known identity (logins, one-word names)."""
+            return m.Anon.text(self, self.code(s))
 
         def text(self, s):
             """Docs, messages and issues: also links naming the project and every known identity."""
@@ -480,7 +601,12 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             if len(data) <= MAX_TEXT and b"\x00" not in data[:8000]:
                 s = data.decode("utf-8", "surrogateescape")
                 base = low.rsplit("/", 1)[-1]
-                s = anon.text(s) if (low.endswith(DOC_EXT) or base.startswith("readme")) else anon.code(s)
+                if low.endswith(DOC_EXT) or base.startswith("readme"):
+                    s = anon.text(s)
+                elif STRUCT_RE.search(low) and hasattr(anon, "meta"):
+                    s = anon.meta(s)
+                else:
+                    s = anon.code(s)
                 return s.encode("utf-8", "surrogateescape")
             return data
 
@@ -554,7 +680,10 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             return m.win_path(fn)
 
         def refname_cb(ref):
-            return rename(ref.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape") if full else ref
+            if not full:
+                return ref
+            r = ref.decode("utf-8", "surrogateescape")
+            return (anon.ref(r) if hasattr(anon, "ref") else rename(r)).encode("utf-8", "surrogateescape")
 
         def commit_cb(c, _meta):
             an, cn = c.author_name.decode("utf-8", "replace"), c.committer_name.decode("utf-8", "replace")

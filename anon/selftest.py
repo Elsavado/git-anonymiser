@@ -1,10 +1,12 @@
 """Self-test (selftest.yml) of the rewrite on a real public repo:
 - the parallel blob step gives exactly the history the one-core rewrite gives, also when a worker dies;
 - the rewritten history has the source's shape (commits, parents, branches, tags) once unpublished refs are gone;
-- a file that takes too long is stopped and replaced; email_sub gives what EMAIL_RE.sub gives.
+- a file that takes too long is stopped and replaced; email_sub gives what EMAIL_RE.sub gives;
+- the replacement rules (made-up names only): escaped underscores, ordinary words kept in prose, logins in merge
+  lines, ref names, TODO(x) and metadata files, reverse-DNS ids, CamelCase joins, bot accounts.
 
 Rewrites one public repo with a throw-away key, ANON_PARALLEL=0 and =1 (and =1 with a dying worker), and compares
-every ref. Usage: python -I anon/selftest.py owner/name
+every ref. Usage: python -I anon/selftest.py owner/name   (or --rules: only the replacement rules)
 """
 import os
 import random
@@ -84,7 +86,40 @@ def check_twins(work, anon):
     return "; ".join(f"twins: {p}" for p in problems) or None
 
 
+def check_rules():
+    """The replacement rules on made-up names (no real project or person)."""
+    work = tempfile.mkdtemp()
+    m.PSEUDO = m.Pseudo(os.path.join(work, "key"))
+    cls, _, _ = extra.install(m, "zorblax-labs", "quuxo_kit", "https://quuxo.dev", ["quuxo.dev", "Quuxo"], "",
+                              "Widget Toolkit")
+    ids = {k: (m.PSEUDO.name(k) if " " in k else m.PSEUDO.login(k)) for k in ("Zed Quorra", "zq9dev", "page", "vtrondel")}
+    a = cls(ids)
+    cases = [
+        ("escaped underscore", a.text(r"see quuxo\_kit/core.py"), lambda r: "quuxo" not in r.lower()),
+        ("ordinary word kept", a.text("split at page boundaries"), lambda r: "at page boundaries" in r),
+        ("ordinary word as @login", a.text("thanks @page"), lambda r: "@page" not in r),
+        ("merge line", a.text("Merge pull request #5 from zorblax-labs/zq9dev-patch-1"),
+         lambda r: "zq9dev" not in r and "zorblax" not in r),
+        ("merge branch", a.text("Merge branch 'vtrondel/fix-join' into main"), lambda r: "vtrondel" not in r),
+        ("ref name", a.ref("refs/heads/vtrondel/fix-join"), lambda r: "vtrondel" not in r and r.startswith("refs/heads/")),
+        ("metadata file", a.meta('{"login": "zq9dev", "name": "Zed Quorra", "role": "page"}'),
+         lambda r: "zq9dev" not in r and "Quorra" not in r and '"page"' in r),
+        ("TODO(login)", a.code("# TODO(vtrondel): remove"), lambda r: "vtrondel" not in r),
+        ("reverse DNS", a.code("appId = 'dev.quuxo.desktop'"), lambda r: "quuxo" not in r.lower()),
+        ("CamelCase join", a.code("class QuuxoDriver(BaseQuuxoError)"), lambda r: "Quuxo" not in r),
+        ("bot account", a.code("zorblax-labs-release[bot]"), lambda r: "zorblax" not in r),
+        ("plain code kept", a.code("page = paginate(page_size)"), lambda r: r == "page = paginate(page_size)"),
+    ]
+    bad = [name for name, got, ok in cases if not ok(got)]
+    print(f"rules: {len(cases) - len(bad)}/{len(cases)} ok" + (f" (failed: {', '.join(bad)})" if bad else ""), flush=True)
+    return f"rules failed: {', '.join(bad)}" if bad else None
+
+
 def main(source):
+    if source == "--rules":
+        problem = check_rules()
+        print("IDENTICAL" if not problem else "PROBLEMS: " + problem)
+        return 0 if not problem else 1
     owner, name = source.split("/")
     problems = [p for p in (check_timeout(), check_email()) if p]
     work = tempfile.mkdtemp()
@@ -115,6 +150,7 @@ def main(source):
     if not (refs["0"] == refs["1"] == refs["1-die"]):
         problems.append("the parallel rewrites differ from the one-core rewrite")
     problems += [p for p in (check_twins(work, anon),) if p]
+    problems += [p for p in (check_rules(),) if p]  # last: it installs a second, made-up project
     print("IDENTICAL" if not problems else "PROBLEMS: " + "; ".join(problems))
     return 0 if not problems else 1
 

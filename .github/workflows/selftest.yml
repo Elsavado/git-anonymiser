@@ -23,6 +23,10 @@ jobs:
           python-version: '3.12'
       - name: Install tools
         run: pip install --quiet git-filter-repo==2.47.0
+      - name: Word list (ordinary words are not replaced on their own)
+        continue-on-error: true
+        run: sudo apt-get install -y -qq wamerican > /dev/null
+
       - name: Rewrite twice and compare
         env:
           PYTHONUTF8: '1'
