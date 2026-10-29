@@ -21,6 +21,7 @@ import io
 import os
 import re
 import struct
+import subprocess
 import time
 import zipfile
 import zlib
@@ -28,6 +29,28 @@ from urllib.parse import urlparse
 
 EMAIL = "redactedemail@gmail.com"
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+# EMAIL_RE.sub retries every start position of a long run of address characters (a 175k-character run without an
+# "@" took 106 s; a 13 MB bundle, hours), so email_sub finds the same matches in one pass: a match always starts
+# where a run of local-part characters starts (or where the last match ended) and ends at the domain after its "@".
+_LOCAL_RUN = re.compile(r"[A-Za-z0-9._%+\-]+")
+_DOMAIN = re.compile(r"[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+
+
+def email_sub(repl, s):
+    """Same result as EMAIL_RE.sub(repl, s) for a string repl, in linear time."""
+    out, last, pos = [], 0, 0
+    while True:
+        run = _LOCAL_RUN.search(s, pos)
+        if not run:
+            break
+        e = run.end()
+        dom = _DOMAIN.match(s, e + 1) if s.startswith("@", e) else None
+        if dom:
+            out += (s[last:run.start()], repl)
+            last = pos = dom.end()
+        else:
+            pos = e
+    return "".join(out) + s[last:] if out else s
 URL_RE = re.compile(r"(?:https?://|www\.)[^\s)\]}>\"'`]+")
 WORD_RE = re.compile(r"\w+")
 AT_RUN_RE = re.compile(r"@([A-Za-z0-9-]+)")
@@ -115,6 +138,34 @@ def placeholder(path, title):
     return ico(p) if ext == ".ico" else p
 
 
+SLOW_BLOB = 300  # seconds: a file that takes longer is replaced by STUCK_TEXT, so one file can never stall a run
+STUCK_TEXT = b"This file was removed: it could not be anonymised automatically.\n"
+
+
+class Slow(Exception):
+    pass
+
+
+def _alarm(_sig, _frame):
+    raise Slow()
+
+
+def timed(fn, *args):
+    """fn(*args), or Slow after SLOW_BLOB seconds (the regex engine checks for signals while it runs). Needs SIGALRM
+    and the main thread (Linux runners); elsewhere there is no limit."""
+    import signal
+    import threading
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        return fn(*args)
+    old = signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(SLOW_BLOB)
+    try:
+        return fn(*args)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 _PRE = None  # (repo, paths, process, cache) for the forked workers of precompute()
 
 
@@ -146,12 +197,14 @@ def _pre_work(oids):
 def precompute(repo, paths, process, stats):
     """Anonymise every blob on all CPU cores before the history rewrite (which runs the blob callback on one core:
     big histories took more than the 6 h job limit). Returns (unchanged blob ids, cache dir of the new contents);
-    the blob callback takes each result from there. Needs fork (Linux); elsewhere, or with ANON_PARALLEL=0, the
-    callback does all the work itself as before."""
+    the blob callback takes each result from there and does any blob without one itself. Needs fork (Linux);
+    elsewhere, or with ANON_PARALLEL=0, the callback does all the work itself as before."""
     global _PRE
     import multiprocessing
     import subprocess
     import tempfile
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
     n = os.cpu_count() or 1
     if n < 2 or os.environ.get("ANON_PARALLEL") == "0" or "fork" not in multiprocessing.get_all_start_methods():
         return set(), None
@@ -163,15 +216,74 @@ def precompute(repo, paths, process, stats):
     chunks = [oids[i::n * 16] for i in range(n * 16)]
     unchanged = set()
     t0 = time.time()
-    with multiprocessing.get_context("fork").Pool(n) as pool:
-        for i, (got, added) in enumerate(pool.imap_unordered(_pre_work, chunks), 1):
+    # Not multiprocessing.Pool: when a worker dies (out of memory) a Pool waits forever for its task, while this
+    # pool raises, and the blob callback then does the blobs that are left.
+    pool = ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("fork"))
+    try:
+        for i, fut in enumerate(as_completed([pool.submit(_pre_work, c) for c in chunks]), 1):
+            got, added = fut.result()
             unchanged.update(got)
             for k, v in added.items():
                 stats[k] = stats.get(k, 0) + v
-            if i % (len(chunks) // 4) == 0:
+            if i % max(1, len(chunks) // 10) == 0:
                 print(f"  blobs anonymised: {i * 100 // len(chunks)}% of {len(oids)} in {time.time() - t0:.0f}s", flush=True)
-    _PRE = None
+    except BrokenProcessPool:
+        print(f"  a worker stopped (out of memory?) after {time.time() - t0:.0f}s; the rewrite does the rest", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        _PRE = None
     return unchanged, cache
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, check=True).stdout
+
+
+def keep_published_refs(repo):
+    """Only branches and tags are published, so only they are rewritten. A mirror clone also holds refs/pull/* (one
+    per PR), refs/notes, refs/remotes ...: filter-repo leaves refs/remotes as they are (erpnext: 3 commits kept their
+    real authors and dates, so verification failed every time), and the pull refs doubled the work (ghostfolio: 79k
+    more files, among them a 13 MB bundle the email regex took hours on). Returns how many refs went."""
+    refs = _git(repo, "for-each-ref", "--format=%(refname)").decode().split()
+    drop = [r for r in refs if not r.startswith(("refs/heads/", "refs/tags/"))]
+    if drop:
+        subprocess.run(["git", "update-ref", "--stdin"], cwd=repo, check=True, capture_output=True,
+                       input="".join(f"delete {r}\n" for r in drop).encode())
+    return len(drop)
+
+
+def shape(repo):
+    """The shape of the history: every commit with its parents, branch tips, and what each tag points at."""
+    parents = {}
+    for line in _git(repo, "rev-list", "--all", "--parents").decode().splitlines():
+        ids = line.split()
+        parents[ids[0]] = ids[1:]
+    heads = _git(repo, "for-each-ref", "--format=%(objectname)", "refs/heads").decode().split()
+    tags = []
+    for line in _git(repo, "for-each-ref", "--format=%(objecttype) %(objectname) %(*objecttype) %(*objectname)",
+                     "refs/tags").decode().splitlines():
+        kind, oid, pkind, poid = (line.split() + ["", ""])[:4]
+        tags.append((pkind, poid) if kind == "tag" else (kind, oid))
+    return {"parents": parents, "heads": sorted(heads), "tags": tags}
+
+
+def shape_problems(before, repo, cmap):
+    """The rewritten history must have exactly the source's shape: same number of commits, each one with the
+    rewritten versions of its own parents in the same order, the same branches and tags on the same commits."""
+    after = shape(repo)
+    bp, ap = before["parents"], after["parents"]
+    problems = []
+    if len(ap) != len(bp):
+        problems.append(f"commit count changed ({len(bp)} in the source, {len(ap)} rewritten)")
+    moved = sum(1 for c, ps in bp.items() if ap.get(cmap.get(c)) != [cmap.get(x) for x in ps])
+    if moved:
+        problems.append(f"{moved} commits not in their place in the history")
+    if sorted(cmap.get(h) or "" for h in before["heads"]) != after["heads"]:
+        problems.append("branches differ from the source")
+    old_tags = sorted(cmap.get(o) or "" if k == "commit" else k for k, o in before["tags"])
+    if old_tags != sorted(o if k == "commit" else k for k, o in after["tags"]):
+        problems.append("tags differ from the source")
+    return problems
 
 
 def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(), keep_owner=False, owners=()):
@@ -315,7 +427,7 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         def code(self, s):
             """Code-safe replacements for any text file."""
             if "@" in s:
-                s = EMAIL_RE.sub(EMAIL, s)
+                s = email_sub(EMAIL, s)
             s = rename(s)
             logins = self.logins_in(s)
             if logins:
@@ -389,6 +501,15 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
 
         def process(path, data):
             """A blob's new content (path: one path it appears at, None when not known)."""
+            try:
+                return timed(process_one, path, data)
+            except Slow:
+                stats["stuck"] = stats.get("stuck", 0) + 1
+                print(f"  a file took over {SLOW_BLOB}s ({len(data)} bytes, type {os.path.splitext(path or '')[1] or '-'})"
+                      "; replaced by a short note", flush=True)
+                return STUCK_TEXT
+
+        def process_one(path, data):
             data = scrub(data)
             if path is not None:
                 low = path.lower()
@@ -475,7 +596,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         m.run(["git", "-c", "pack.threads=1", "gc", "--prune=now", "--quiet"], cwd=repo)
         if full:
             m.log(f"full pass: {stats['tweaked']} text files changed, {stats['logos']} logos/screenshots replaced, "
-                  f"{stats['renamed_paths']} paths renamed, {stats.get('zips', 0)} zip archives cleaned")
+                  f"{stats['renamed_paths']} paths renamed, {stats.get('zips', 0)} zip archives cleaned, "
+                  f"{stats.get('stuck', 0)} files too slow to anonymise (replaced)")
         return cmap, len(stats["licenses_removed"])
 
     m.rewrite = rewrite

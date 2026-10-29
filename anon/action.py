@@ -463,7 +463,10 @@ def anonymise():
     os.makedirs(WORK, exist_ok=True)
     repo = os.path.join(WORK, "repo.git")
     m.clone(owner, name, TOK, repo)
-    m.log(f"cloned in {round(time.time() - T0)}s")
+    dropped = extra.keep_published_refs(repo)
+    source = extra.shape(repo)
+    m.log(f"cloned in {round(time.time() - T0)}s: {len(source['parents'])} commits, {len(source['heads'])} branches, "
+          f"{len(source['tags'])} tags ({dropped} pull-request and other unpublished refs left out)")
     findings = m.gitleaks(repo, os.path.join(WORK, "leaks.json"))
     raw = os.path.join(WORK, "api_raw.json")
     with open(raw, "w", encoding="utf-8") as f:
@@ -486,11 +489,13 @@ def anonymise():
     for c in data.get("review_comments", []):
         c["_num"] = num(c.get("pull_request_url"))
     clean = m.anon_api(data, cmap, anon, secrets)
-    problems = m.verify_clean(repo, cmap)
+    problems = m.verify_clean(repo, cmap) + extra.shape_problems(source, repo, cmap)
     if after:
         problems.append(f"{len(after)} gitleaks finding(s) remain after the rewrite")
     if problems:
         sys.exit("not pushed, verification failed: " + "; ".join(problems))
+    m.log(f"history check: {len(source['parents'])} commits with the same parents, {len(source['heads'])} branches and "
+          f"{len(source['tags'])} tags, as in the source")
     os.makedirs(STATE, exist_ok=True)
     with open(os.path.join(STATE, "api.json"), "w", encoding="utf-8") as f:
         json.dump(clean, f)
@@ -541,7 +546,24 @@ def push(repo):
         if not send(*[f"+{t}:{t}" for t in tags[i:i + 100]]):
             m.log(f"warning: a batch of {len(tags[i:i + 100])} tags was not pushed")
     api("PATCH", f"repos/{OWNER}/{TARGET}", {"default_branch": head.removeprefix("refs/heads/")})
-    m.log(f"pushed {len(branches)} branches, {len(tags)} tags to a new private repo")
+    # The repo on GitHub must hold exactly these branches and tags (a failed tag batch used to be only a warning).
+    local = dict(x.split() for x in git("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads",
+                                        "refs/tags").decode().splitlines())
+    for attempt in range(3):
+        p = subprocess.run(["git", "ls-remote", "--heads", "--tags", url], cwd=repo, capture_output=True)
+        remote = {r: o for o, r in (x.split() for x in p.stdout.decode().splitlines()) if not r.endswith("^{}")}
+        wrong = sorted(r for r, o in local.items() if remote.get(r) != o)
+        extra_refs = sorted(set(remote) - set(local))
+        if p.returncode == 0 and not wrong and not extra_refs:
+            break
+        for r in wrong:
+            send(f"+{r}:{r}")
+        for r in extra_refs:
+            send(f":{r}")
+    else:
+        sys.exit(f"the private repo does not match the rewritten history: {len(wrong)} refs missing or different, "
+                 f"{len(extra_refs)} refs too many")
+    m.log(f"pushed {len(branches)} branches, {len(tags)} tags to a new private repo; all {len(local)} match")
     open(os.path.join(STATE, "pushed"), "w").close()  # a retry after this point only redoes the issue import
 
 
