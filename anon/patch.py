@@ -106,6 +106,11 @@ class Rules:
                 joined = "".join(w).lower()
                 if len(joined) >= 6:
                     self.map.setdefault(joined, f"{f.lower()}-{l_.lower()}")
+                    self.map.setdefault("-".join(w).lower(), f"{f.lower()}-{l_.lower()}")  # first-last
+            parts = re.split(r"[-_]+", p)
+            if len(w) == 1 and len(parts) >= 2 and all(len(x) >= 3 and x.isalpha() for x in parts):
+                f, l_ = self.pick(p)  # a login like first-last also written as "First Last"
+                self.map.setdefault(" ".join(parts).lower(), f"{f} {l_}")
         mask(*self.map)
         alts = sorted(self.map, key=len, reverse=True)
         self.steps = [(re.compile(a), b) for a, b in cfg.get("pre", [])]
