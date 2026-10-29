@@ -453,6 +453,10 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
         full = bool(full)
         stats = {"licenses_removed": set(), "logos": 0, "renamed_paths": 0, "tweaked": 0}
         paths = {}
+        siblings, twins = {}, {}  # commit -> its parents; parents -> the commits written on them so far
+        for line in m.run(["git", "rev-list", "--all", "--parents"], cwd=repo).splitlines():
+            ids = line.split(b" ", 1)
+            siblings[ids[0]] = ids[1] if len(ids) == 2 else b""
         if full:  # blob id -> one path it appears at (blob callbacks get no path)
             for line in m.run(["git", "rev-list", "--all", "--objects"], cwd=repo).splitlines():
                 parts = line.split(b" ", 1)
@@ -561,6 +565,14 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 c.message = anon.bytes(scrub(c.message))
             else:
                 c.message = scrub(c.message)
+            # Commits on the same parents that differed only in their exact time or e-mail would become one and the
+            # same commit (llm-d: two commits 1 s apart): the later one moves on by 10 minutes, so none is lost.
+            group = twins.setdefault(siblings.get(c.original_id), set())
+            while (key := hashlib.sha1(b"\0".join((c.author_name, c.author_date, c.committer_name, c.committer_date,
+                                                   c.message))).digest()) in group:
+                secs, tz = c.committer_date.split()
+                c.committer_date = b"%d %s" % (int(secs) + 600, tz)
+            group.add(key)
 
         def tag_cb(t, _meta):
             if t.tagger_name is not None:

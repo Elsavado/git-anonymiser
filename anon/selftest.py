@@ -61,6 +61,29 @@ def check_email():
     print("email: 100000 random strings same as the regex, long run fast", flush=True)
 
 
+def check_twins(work, anon):
+    """Two commits on the same parent, 1 s apart from two e-mails, must stay two commits after rounding."""
+    repo = os.path.join(work, "twins.git")
+    subprocess.run(["git", "init", "-q", "--bare", repo], check=True)
+    git = lambda *a, **env: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True,  # noqa: E731
+                                           env={**os.environ, **env}).stdout.decode().strip()
+    tree = subprocess.run(["git", "mktree"], cwd=repo, input=b"", capture_output=True, check=True).stdout.decode().strip()
+    who = dict(GIT_AUTHOR_NAME="Ann Example", GIT_COMMITTER_NAME="Ann Example")
+    base = git("commit-tree", tree, "-m", "base", **who, GIT_AUTHOR_EMAIL="a@x.org", GIT_COMMITTER_EMAIL="a@x.org",
+               GIT_AUTHOR_DATE="1700000000 +0000", GIT_COMMITTER_DATE="1700000000 +0000")
+    for i, mail in enumerate(("a@x.org", "a@y.org")):
+        c = git("commit-tree", tree, "-p", base, "-m", "same change", **who, GIT_AUTHOR_EMAIL=mail,
+                GIT_COMMITTER_EMAIL=mail, GIT_AUTHOR_DATE=f"{1700000100 + i} +0200",
+                GIT_COMMITTER_DATE=f"{1700000100 + i} +0200")
+        git("update-ref", f"refs/heads/b{i}", c)
+    git("symbolic-ref", "HEAD", "refs/heads/b0")
+    src = extra.shape(repo)
+    cmap, _ = m.rewrite(repo, [], anon, True)
+    problems = extra.shape_problems(src, repo, cmap)
+    print(f"twins: {len(src['parents'])} commits in, {len(extra.shape(repo)['parents'])} out", flush=True)
+    return "; ".join(f"twins: {p}" for p in problems) or None
+
+
 def main(source):
     owner, name = source.split("/")
     problems = [p for p in (check_timeout(), check_email()) if p]
@@ -91,6 +114,7 @@ def main(source):
               f"shape {'same as the source' if not shape else 'DIFFERENT'}", flush=True)
     if not (refs["0"] == refs["1"] == refs["1-die"]):
         problems.append("the parallel rewrites differ from the one-core rewrite")
+    problems += [p for p in (check_twins(work, anon),) if p]
     print("IDENTICAL" if not problems else "PROBLEMS: " + "; ".join(problems))
     return 0 if not problems else 1
 
