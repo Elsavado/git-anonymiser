@@ -302,7 +302,7 @@ def rewrite(R):
         s = ref.decode("utf-8", "surrogateescape")
         for pre in ("refs/heads/", "refs/tags/"):
             if s.startswith(pre):
-                n = pre + R.apply(s[len(pre):])
+                n = extra.safe_ref(pre + R.apply(s[len(pre):]))
                 if n != s:
                     st["refs_renamed"] += 1
                     return n.encode("utf-8", "surrogateescape")

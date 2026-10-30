@@ -183,6 +183,12 @@ def ico(p):
     return struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(p), 22) + p
 
 
+def safe_ref(r):
+    """A renamed ref that git accepts: an imaginary name put into a ref (archive/<login>/x) has spaces."""
+    r = re.sub(r"[\s~^:?*\[\\\x00-\x1f\x7f]+", "-", r).replace("@{", "-").replace("..", ".")
+    return "/".join(p.strip(".").removesuffix(".lock") or "-" for p in r.split("/"))
+
+
 def placeholder(path, title):
     ext = os.path.splitext(path.lower())[1]
     if ext == ".svg":  # no text: the imaginary title's initials can spell the original acronym
@@ -688,7 +694,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
             if not full:
                 return ref
             r = ref.decode("utf-8", "surrogateescape")
-            return (anon.ref(r) if hasattr(anon, "ref") else rename(r)).encode("utf-8", "surrogateescape")
+            n = anon.ref(r) if hasattr(anon, "ref") else rename(r)
+            return (safe_ref(n) if n != r else r).encode("utf-8", "surrogateescape")
 
         def commit_cb(c, _meta):
             an, cn = c.author_name.decode("utf-8", "replace"), c.committer_name.decode("utf-8", "replace")
