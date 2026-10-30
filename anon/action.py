@@ -637,6 +637,50 @@ def items(data):
         yield n, {"issue": issue, "comments": cs}
 
 
+def iso_epoch(s):
+    return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) if s else None
+
+
+def seen_key(title, created):
+    return " ".join((title or "").split()), (iso_epoch(created) or 0) // 60
+
+
+def refill(todo, accept):
+    """Imports the queue accepted but GitHub dropped later (the account's hourly content limit): find the items
+    missing from the repo by title and creation time and import only those again, slowly. True: more to do."""
+    have, cur = set(), None
+    q = ("query($o: String!, $n: String!, $c: String) { repository(owner: $o, name: $n) { issues(first: 100, "
+         "after: $c) { pageInfo { hasNextPage endCursor } nodes { title createdAt } } } }")
+    while True:
+        got, err = api("POST", "graphql", {"query": q, "variables": {"o": OWNER, "n": TARGET, "c": cur}})
+        if not got:
+            m.log(f"refill: could not list the issues ({(err or '')[:80]})")
+            return False
+        d = got["data"]["repository"]["issues"]
+        have.update(seen_key(x["title"], x["createdAt"]) for x in d["nodes"])
+        if not d["pageInfo"]["hasNextPage"]:
+            break
+        cur = d["pageInfo"]["endCursor"]
+    missing = [p for _, p in todo if p["issue"].get("created_at")  # without a date it cannot be matched
+               and seen_key(p["issue"]["title"], p["issue"]["created_at"]) not in have]
+    if len(missing) > len(todo) - len(have) + 10:  # more than the repo lacks: the matching is off, so no duplicates
+        m.log(f"refill: {len(missing)} unmatched but only {len(todo) - len(have)} missing; nothing imported")
+        return False
+    m.log(f"refill: {len(missing)} items missing, importing them again")
+    for i, payload in enumerate(missing):
+        if time.time() - T0 > BUDGET:
+            m.log(f"refill: {i}/{len(missing)} sent; continuing in a new run")
+            return True
+        res, err = api("POST", f"repos/{OWNER}/{TARGET}/import/issues", payload, accept)
+        if not res:
+            m.log(f"refill item not imported ({(err or 'error')[:80]})")
+        time.sleep(REFILL_GAP)
+    return False
+
+
+REFILL_GAP = 8  # seconds: ~450 items an hour, under the account's hourly limit with other jobs running
+
+
 def import_issues():
     with open(os.path.join(STATE, "api.json"), encoding="utf-8") as f:
         data = json.load(f)
@@ -670,6 +714,8 @@ def import_issues():
         with open(prog_path, "w") as f:
             json.dump(prog, f)
     more = prog["done"] < len(todo)
+    if not more and prog.get("failed"):
+        more = refill(todo, accept)
     if not more:
         got, _ = api("POST", "graphql", {"query": "query($o: String!, $n: String!) { repository(owner: $o, name: $n) "
                                                   "{ issues { totalCount } } }", "variables": {"o": OWNER, "n": TARGET}})
