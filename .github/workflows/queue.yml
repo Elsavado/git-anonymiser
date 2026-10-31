@@ -1,0 +1,56 @@
+name: Queue
+
+# Starts queued jobs from queue/jobs.txt one at a time without crowding the runs already going.
+# Each line: "<tier> <encrypted job>". Tier 1 starts while at most 3 anonymise/patch runs are active.
+# Tier 2 (large repositories) starts only when none are active and no anonymise run finished in the last
+# 40 minutes (so a chain handing over to its next run is never mistaken for idle).
+# Repo variable QUEUE_POS is the number of lines already started; set QUEUE to "off" to pause.
+on:
+  schedule:
+    - cron: '17,37,57 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: queue
+  cancel-in-progress: false
+
+jobs:
+  next:
+    if: vars.QUEUE != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: queue
+      - name: Start the next job when there is room
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+          R: ${{ github.repository }}
+          POS: ${{ vars.QUEUE_POS || '0' }}
+        run: |
+          export GH_TOKEN=$OWN
+          total=$(grep -c . queue/jobs.txt || true)
+          if [ "$POS" -ge "$total" ]; then echo "queue empty ($POS/$total)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          line=$(grep . queue/jobs.txt | sed -n "$((POS + 1))p")
+          tier=${line%% *}; job=${line#* }
+          count() { gh api "repos/$R/actions/workflows/$1/runs?status=$2&per_page=100" -q '.total_count'; }
+          active=$(( $(count anonymise.yml in_progress) + $(count anonymise.yml queued) + $(count patch.yml in_progress) + $(count patch.yml queued) ))
+          recent=$(gh api "repos/$R/actions/workflows/anonymise.yml/runs?status=completed&per_page=20" \
+                   -q "[.workflow_runs[]|select(.updated_at > \"$(date -u -d '-40 minutes' +%FT%TZ)\")]|length")
+          echo "next: line $((POS + 1))/$total tier $tier; active $active; finished in last 40 min $recent" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$tier" = 1 ]; then ok=$([ "$active" -le 3 ] && echo y); else ok=$([ "$active" -eq 0 ] && [ "$recent" -eq 0 ] && echo y); fi
+          [ "$ok" = y ] || { echo "waiting for room" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+          for t in "$OWN" "$PAT"; do
+            if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job"; then
+              GH_TOKEN=$PAT gh variable set QUEUE_POS -R "$R" --body "$((POS + 1))"
+              echo "started line $((POS + 1))" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "dispatch failed; will retry" | tee -a "$GITHUB_STEP_SUMMARY"
