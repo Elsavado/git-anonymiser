@@ -1,0 +1,49 @@
+name: Prune issues
+
+# Deletes the plain issues (imported pull requests stay) from finished anonymised repos. The repo list arrives
+# encrypted and every name is masked, so this public repo shows counts only. Repos still importing are skipped
+# and retried; each run hands what is left to the next one.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Encrypted JSON list of owner/repo
+        required: true
+
+run-name: Prune issues
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete plain issues
+        id: prune
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          JOB: ${{ inputs.job }}
+          JOB_KEY: ${{ secrets.JOB_KEY }}
+          BUDGET_MIN: '330'
+        run: python -I anon/prune.py
+      - name: Hand over what is left
+        if: steps.prune.outputs.more == 'true'
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # a short run means only busy repos were left: wait an hour before trying them again
+          started=$(GH_TOKEN=$OWN gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" -q .run_started_at)
+          [ $(( $(date +%s) - $(date -d "$started" +%s) )) -lt 1800 ] && sleep 3600
+          for t in "$OWN" "$PAT"; do
+            GH_TOKEN=$t gh workflow run prune.yml -R "${{ github.repository }}" -f job="$(cat next-job.txt)" && exit 0
+            sleep 30
+          done
