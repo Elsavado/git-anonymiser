@@ -529,6 +529,10 @@ def push(repo):
         sys.exit(f"could not create the private repo: {err}")
     if not got.get("private"):
         sys.exit("the new repo is not private; stopping before any push")
+    # The copied history carries the project's own workflows (CI, issue bots): they must never run in the copy,
+    # or every push and every imported issue starts them (failed-run e-mails, bot comments, private minutes).
+    if api("PUT", f"repos/{OWNER}/{TARGET}/actions/permissions", {"enabled": False})[1]:
+        sys.exit("could not turn off Actions in the new repo; stopping before any push")
     url = f"https://x-access-token:{TOK}@github.com/{OWNER}/{TARGET}.git"
 
     def send(*specs):
