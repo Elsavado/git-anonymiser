@@ -79,6 +79,7 @@ if (JOB.get("owner") or "").strip():  # target repo in another account: its toke
     print(f"::add-mask::{TOK}", flush=True)
 MODE = os.environ.get("MODE", "all")
 PR_LABEL, MERGED_LABEL = "pull request", "merged"
+PRS_ONLY = os.environ.get("PRS_ONLY") == "1"  # import pull requests only (issues left out)
 MAX_BODY = 60000
 
 # READMEs stay, anonymised (extra.py); LICENSE files are removed from the whole history (mirror.py).
@@ -404,7 +405,7 @@ def fetch_all(meta):
     owners = sorted({meta[k]["owner"]["login"] for k in ("parent", "source") if meta.get(k)})
     if not any(f.endswith(".cursor") and not f.startswith("gql_") for f in os.listdir(FETCH)):
         try:
-            for kind in (["issues"] if meta.get("has_issues") else []) + ["pullRequests"]:
+            for kind in (["issues"] if meta.get("has_issues") and not PRS_ONLY else []) + ["pullRequests"]:
                 gql_list(kind, toks)
             data = gql_load()
             data.update(errors={}, _upstream_owners=owners)
@@ -700,6 +701,13 @@ def import_issues():
         with open(prog_path) as f:
             prog = json.load(f)
     todo = list(items(data))
+    # PRs only: decided when the import starts and kept in the state, so a chain that began with issues keeps them
+    # (the progress counter indexes this list) and one that began without never gains them
+    marker = os.path.join(STATE, "prs_only")
+    if PRS_ONLY and prog["done"] == 0 and not os.path.exists(marker):
+        open(marker, "w").close()
+    if os.path.exists(marker):
+        todo = [t for t in todo if PR_LABEL in t[1]["issue"]["labels"]]
     accept = "application/vnd.github.golden-comet-preview+json"
     m.log(f"issue import: {len(todo)} items, {prog['done']} already done")
     for i, (_, payload) in enumerate(todo):

@@ -82,6 +82,7 @@ jobs:
           JOB_KEY: ${{ secrets.JOB_KEY }}
           JOB: ${{ inputs.job }}
           NAMES_REPO: ${{ secrets.NAMES_REPO }}
+          PRS_ONLY: '1'  # import pull requests only (a chain that began with issues keeps them)
           MODE: ${{ inputs.mode }}
           OWNER: ${{ github.repository_owner }}
           PYTHONUTF8: '1'
