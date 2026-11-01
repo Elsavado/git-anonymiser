@@ -70,6 +70,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          TARGET_PAT: ${{ secrets.TARGET_PAT }}  # token of another target account (job option "owner")
           READ_TOKEN: ${{ github.token }}
           APP_ID: ${{ secrets.APP_ID }}  # optional GitHub App: its own read quota
           APP_KEY: ${{ secrets.APP_KEY }}

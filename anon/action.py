@@ -42,6 +42,7 @@ FRESH_RUN = 45 * 60  # history fetched later than this into a run: the rewrite s
 FETCH = os.path.join(STATE, "fetch")
 T0 = time.time()
 TOK = os.environ["GH_TOKEN"]
+HOME_TOK = TOK  # this account's PAT: the name record lives in its private repo
 OWNER = os.environ["OWNER"]
 
 
@@ -71,6 +72,11 @@ OWNERS = [a.strip() for a in (JOB.get("owners") or "").split(",") if a.strip()] 
 KEEP_OWNER = bool(JOB.get("keep_owner"))  # the owner is also a framework the code imports
 PEOPLE = [a.strip() for a in (JOB.get("people") or "").split(",") if a.strip()]  # other real names to replace
 mask(SOURCE, *SOURCE.split("/"), TARGET, GIVEN_NAME, *ALIASES, *NAMES, *OWNERS, *PEOPLE)
+APP_OWNER = OWNER  # the GitHub App is installed on this repository's owner
+if (JOB.get("owner") or "").strip():  # target repo in another account: its token creates the repo and the issues
+    OWNER = JOB["owner"].strip()
+    TOK = os.environ.get("TARGET_PAT") or sys.exit("job names another target account but TARGET_PAT is not set")
+    print(f"::add-mask::{TOK}", flush=True)
 MODE = os.environ.get("MODE", "all")
 PR_LABEL, MERGED_LABEL = "pull request", "merged"
 MAX_BODY = 60000
@@ -85,13 +91,13 @@ def out(key, value):
         f.write(f"{key}={value}\n")
 
 
-def api(method, path, body=None, accept=None):
+def api(method, path, body=None, accept=None, tok=None):
     """One REST call through gh (waits for the quota when it is used up). Returns (json, error)."""
     for attempt in range(1, 21):  # rate limits are shared with every other job on the account: be patient
         cmd = ["gh", "api", "-X", method, path]
         if accept:
             cmd += ["-H", f"Accept: {accept}"]
-        p = subprocess.run(cmd + (["--input", "-"] if body is not None else []), env=m.gh_env(TOK),
+        p = subprocess.run(cmd + (["--input", "-"] if body is not None else []), env=m.gh_env(tok or TOK),
                            input=json.dumps(body).encode() if body is not None else None, capture_output=True)
         if p.returncode == 0:
             return (json.loads(p.stdout) if p.stdout.strip() else {}), None
@@ -142,7 +148,7 @@ def app_token():
             "Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
-    inst = call(f"https://api.github.com/users/{OWNER}/installation")
+    inst = call(f"https://api.github.com/users/{APP_OWNER}/installation")
     tok = call(f"https://api.github.com/app/installations/{inst['id']}/access_tokens", "POST")["token"]
     print(f"::add-mask::{tok}", flush=True)
     APP.update(token=tok, until=time.time() + 50 * 60)
@@ -573,14 +579,14 @@ def record_name(title):
     repo = os.environ["NAMES_REPO"]  # private: the record must never sit in the public repo
     line = f"{time.strftime('%Y-%m-%d')},{SOURCE},{title},{OWNER}/{TARGET}\n"
     for _ in range(8):  # parallel runs: retry on a stale file version
-        cur, err = api("GET", f"repos/{repo}/contents/names.csv")
+        cur, err = api("GET", f"repos/{repo}/contents/names.csv", tok=HOME_TOK)
         text = base64.b64decode(cur["content"]).decode() if cur else "date,original repo,imaginary name,new repo\n"
         if f",{SOURCE}," in text:  # a rerun of a project already recorded
             return
         body = {"message": "Record a project name", "content": base64.b64encode((text + line).encode()).decode()}
         if cur:
             body["sha"] = cur["sha"]
-        if api("PUT", f"repos/{repo}/contents/names.csv", body)[0] is not None:
+        if api("PUT", f"repos/{repo}/contents/names.csv", body, tok=HOME_TOK)[0] is not None:
             return
         time.sleep(5)
     m.log("warning: the name record could not be saved")
