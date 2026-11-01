@@ -22,9 +22,13 @@ on:
         description: (set by the workflow) retry number after a problem
         required: false
         default: '1'
+      lane:
+        description: (set by the queue) queue lane; runs of one lane never hold up the other
+        required: false
+        default: ''
 
 # "from <run>" lets the watchdog see which runs already have a successor.
-run-name: Anonymise (${{ inputs.mode }}, attempt ${{ inputs.attempt }}${{ inputs.from_run != '' && format(', from {0}', inputs.from_run) || '' }})
+run-name: Anonymise (${{ inputs.lane != '' && format('{0}, ', inputs.lane) || '' }}${{ inputs.mode }}, attempt ${{ inputs.attempt }}${{ inputs.from_run != '' && format(', from {0}', inputs.from_run) || '' }})
 
 permissions:
   contents: read
@@ -134,7 +138,7 @@ jobs:
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do
             for t in "$OWN" "$PAT"; do
-              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode="${{ steps.anon.outputs.next }}" -f from_run="${{ github.run_id }}" && exit 0
+              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode="${{ steps.anon.outputs.next }}" -f from_run="${{ github.run_id }}" -f lane="${{ inputs.lane }}" && exit 0
             done
             sleep $(( i * 30 ))
           done
@@ -154,7 +158,7 @@ jobs:
           sleep 120
           for i in 1 2 3 4 5 6 7 8 9 10; do
             for t in "$OWN" "$PAT"; do
-              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=$mode -f from_run="${{ github.run_id }}" -f attempt=$(( ${{ inputs.attempt }} + 1 )) && { echo "Problem in attempt ${{ inputs.attempt }}; retrying ($mode)" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+              GH_TOKEN=$t gh workflow run anonymise.yml -R "${{ github.repository }}" -f job="$JOB" -f mode=$mode -f from_run="${{ github.run_id }}" -f attempt=$(( ${{ inputs.attempt }} + 1 )) -f lane="${{ inputs.lane }}" && { echo "Problem in attempt ${{ inputs.attempt }}; retrying ($mode)" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
             done
             sleep $(( i * 30 ))
           done

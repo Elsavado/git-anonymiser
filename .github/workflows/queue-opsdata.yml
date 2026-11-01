@@ -1,0 +1,74 @@
+name: Queue opsdata
+# Second lane: the opsdata jobs (queue/opsdata.txt, position QUEUE_OPS_POS, pause with QUEUE_OPS=off). Their
+# repos go to another account, so they never wait for the main lane and the main lane never waits for them.
+
+# Starts queued jobs from queue/jobs.txt one at a time without crowding the runs already going.
+# Each line: "<tier> <encrypted job>". Tier 1 starts while at most 3 anonymise/patch runs are active.
+# Tier 2 (large repositories) starts only when none are active and no anonymise run finished in the last
+# 40 minutes (so a chain handing over to its next run is never mistaken for idle).
+# One run checks every 10 minutes for about 5.5 hours, then starts its successor while the queue is not
+# empty (scheduled triggers on this repository fire only every few hours, so they are just a backup).
+# Repo variable QUEUE_POS is the number of lines already started; set QUEUE to "off" to pause.
+on:
+  schedule:
+    - cron: '47 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: queue-opsdata
+  cancel-in-progress: false
+
+jobs:
+  next:
+    if: vars.QUEUE_OPS != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: queue
+      - name: Start queued jobs when there is room
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+          R: ${{ github.repository }}
+        run: |
+          set +e
+          export GH_TOKEN=$OWN
+          FILE=queue/opsdata.txt; POSVAR=QUEUE_OPS_POS; export LANE=opsdata; LIMIT=3
+          total=$(grep -c . $FILE)
+          # runs of this lane only: the opsdata lane's titles start "Anonymise (opsdata, ", the main lane's do not
+          mine='select(if env.LANE == "" then (.display_title|startswith("Anonymise (opsdata, ")|not) else (.display_title|startswith("Anonymise (\(env.LANE), ")) end)'
+          count() { gh api "repos/$R/actions/workflows/$1/runs?status=$2&per_page=100" -q "[.workflow_runs[]|$mine]|length" || echo 99; }
+          end=$(( $(date +%s) + 330 * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            [ "$(GH_TOKEN=$PAT gh variable get QUEUE_OPS -R "$R" 2>/dev/null)" = off ] && { echo "paused"; exit 0; }
+            pos=$(GH_TOKEN=$PAT gh variable get $POSVAR -R "$R" 2>/dev/null || echo 0)
+            if [ "$pos" -ge "$total" ]; then echo "queue empty ($pos/$total)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            line=$(grep . $FILE | sed -n "$((pos + 1))p")
+            tier=${line%% *}; job=${line#* }
+            active=$(( $(count anonymise.yml in_progress) + $(count anonymise.yml queued) + $(count patch.yml in_progress) + $(count patch.yml queued) ))
+            recent=$(gh api "repos/$R/actions/workflows/anonymise.yml/runs?status=completed&per_page=40" \
+                     -q "[.workflow_runs[]|$mine|select(.updated_at > \"$(date -u -d '-40 minutes' +%FT%TZ)\")]|length" || echo 99)
+            ok=n
+            if [ "$tier" = 1 ]; then [ "$active" -le "$LIMIT" ] && ok=y; else [ "$active" -eq 0 ] && [ "$recent" -eq 0 ] && ok=y; fi
+            echo "$(date -u +%H:%M) line $((pos + 1))/$total tier $tier; active $active; finished in last 40 min $recent; start $ok" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "$ok" = y ]; then
+              for t in "$OWN" "$PAT"; do
+                if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job" -f lane="$LANE"; then
+                  GH_TOKEN=$PAT gh variable set $POSVAR -R "$R" --body "$((pos + 1))"
+                  echo "started line $((pos + 1))" | tee -a "$GITHUB_STEP_SUMMARY"
+                  break
+                fi
+              done
+              sleep 300   # let the new run register before counting again
+            else
+              sleep 600
+            fi
+          done
+          echo "handing over to the next queue run" | tee -a "$GITHUB_STEP_SUMMARY"
+          GH_TOKEN=$OWN gh workflow run queue-opsdata.yml -R "$R" || GH_TOKEN=$PAT gh workflow run queue-opsdata.yml -R "$R"

@@ -43,8 +43,9 @@ jobs:
             gh api "repos/$R/actions/runs/$id/artifacts" -q '.artifacts[]|select(.name=="next" and (.expired|not))|.id' | grep -q . || continue
             rm -rf n && gh run download "$id" -R "$R" -n next -D n || continue
             { read -r mode; read -r attempt; read -r job; } < n/next.txt
+            lane=$(gh api "repos/$R/actions/runs/$id" -q '.display_title' | sed -n 's/^Anonymise (\(opsdata\), .*/\1/p')
             for t in "$OWN" "$PAT"; do
-              if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job" -f mode="$mode" -f from_run="$id" -f attempt="$attempt"; then
+              if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job" -f mode="$mode" -f from_run="$id" -f attempt="$attempt" -f lane="$lane"; then
                 echo "restarted the chain of run $id ($mode, attempt $attempt)" | tee -a "$GITHUB_STEP_SUMMARY"
                 restarted=$((restarted + 1)); break
               fi

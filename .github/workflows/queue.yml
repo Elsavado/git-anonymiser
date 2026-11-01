@@ -37,25 +37,28 @@ jobs:
         run: |
           set +e
           export GH_TOKEN=$OWN
-          total=$(grep -c . queue/jobs.txt)
-          count() { gh api "repos/$R/actions/workflows/$1/runs?status=$2&per_page=100" -q '.total_count' || echo 99; }
+          FILE=queue/jobs.txt; POSVAR=QUEUE_POS; export LANE=''; LIMIT=3
+          total=$(grep -c . $FILE)
+          # runs of this lane only: the opsdata lane's titles start "Anonymise (opsdata, ", the main lane's do not
+          mine='select(if env.LANE == "" then (.display_title|startswith("Anonymise (opsdata, ")|not) else (.display_title|startswith("Anonymise (\(env.LANE), ")) end)'
+          count() { gh api "repos/$R/actions/workflows/$1/runs?status=$2&per_page=100" -q "[.workflow_runs[]|$mine]|length" || echo 99; }
           end=$(( $(date +%s) + 330 * 60 ))
           while [ "$(date +%s)" -lt "$end" ]; do
             [ "$(GH_TOKEN=$PAT gh variable get QUEUE -R "$R" 2>/dev/null)" = off ] && { echo "paused"; exit 0; }
-            pos=$(GH_TOKEN=$PAT gh variable get QUEUE_POS -R "$R" 2>/dev/null || echo 0)
+            pos=$(GH_TOKEN=$PAT gh variable get $POSVAR -R "$R" 2>/dev/null || echo 0)
             if [ "$pos" -ge "$total" ]; then echo "queue empty ($pos/$total)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
-            line=$(grep . queue/jobs.txt | sed -n "$((pos + 1))p")
+            line=$(grep . $FILE | sed -n "$((pos + 1))p")
             tier=${line%% *}; job=${line#* }
             active=$(( $(count anonymise.yml in_progress) + $(count anonymise.yml queued) + $(count patch.yml in_progress) + $(count patch.yml queued) ))
-            recent=$(gh api "repos/$R/actions/workflows/anonymise.yml/runs?status=completed&per_page=20" \
-                     -q "[.workflow_runs[]|select(.updated_at > \"$(date -u -d '-40 minutes' +%FT%TZ)\")]|length" || echo 99)
+            recent=$(gh api "repos/$R/actions/workflows/anonymise.yml/runs?status=completed&per_page=40" \
+                     -q "[.workflow_runs[]|$mine|select(.updated_at > \"$(date -u -d '-40 minutes' +%FT%TZ)\")]|length" || echo 99)
             ok=n
-            if [ "$tier" = 1 ]; then [ "$active" -le 3 ] && ok=y; else [ "$active" -eq 0 ] && [ "$recent" -eq 0 ] && ok=y; fi
+            if [ "$tier" = 1 ]; then [ "$active" -le "$LIMIT" ] && ok=y; else [ "$active" -eq 0 ] && [ "$recent" -eq 0 ] && ok=y; fi
             echo "$(date -u +%H:%M) line $((pos + 1))/$total tier $tier; active $active; finished in last 40 min $recent; start $ok" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ "$ok" = y ]; then
               for t in "$OWN" "$PAT"; do
-                if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job"; then
-                  GH_TOKEN=$PAT gh variable set QUEUE_POS -R "$R" --body "$((pos + 1))"
+                if GH_TOKEN=$t gh workflow run anonymise.yml -R "$R" -f job="$job" -f lane="$LANE"; then
+                  GH_TOKEN=$PAT gh variable set $POSVAR -R "$R" --body "$((pos + 1))"
                   echo "started line $((pos + 1))" | tee -a "$GITHUB_STEP_SUMMARY"
                   break
                 fi
