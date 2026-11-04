@@ -87,7 +87,8 @@ def fix(repo):
     auth = base64.b64encode(f"x-access-token:{TOK}".encode()).decode()
     hdr = ["-c", f"http.extraheader=Authorization: Basic {auth}"]
     r = subprocess.run(["git", *hdr, "clone", "-q", "--depth", "1", "--branch", branch, "--no-tags",
-                        f"https://github.com/{repo}.git", d], capture_output=True)
+                        f"https://github.com/{repo}.git", d], capture_output=True,
+                       env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})  # LFS files stay pointers (never edited)
     if r.returncode != 0:
         print("  clone failed")
         return "missing"
