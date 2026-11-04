@@ -82,7 +82,7 @@ PR_LABEL, MERGED_LABEL = "pull request", "merged"
 PRS_ONLY = os.environ.get("PRS_ONLY") == "1"  # import pull requests only (issues left out)
 MAX_BODY = 60000
 
-# READMEs stay, anonymised (extra.py); LICENSE files are removed from the whole history (mirror.py).
+# READMEs stay, anonymised and cleaned (extra.py + readme.py: technical sections only, no links); LICENSE files are removed from the whole history (mirror.py).
 m.token = lambda acct: TOK
 ANON = m.Anon
 

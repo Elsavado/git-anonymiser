@@ -27,6 +27,8 @@ import zipfile
 import zlib
 from urllib.parse import urlparse
 
+import readme  # README trimming + open-source wording + links (anon/readme.py)
+
 EMAIL = "redactedemail@gmail.com"
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 # EMAIL_RE.sub retries every start position of a long run of address characters (a 175k-character run without an
@@ -614,6 +616,8 @@ def install(m, owner, name, homepage="", aliases=(), about="", given="", names=(
                 base = low.rsplit("/", 1)[-1]
                 if low.endswith(DOC_EXT) or base.startswith("readme"):
                     s = anon.text(s)
+                    if not low.endswith((".html", ".htm")):
+                        s = readme.clean_doc(s, base)  # informative only, no open-source wording, no links (2026-11-04)
                 elif STRUCT_RE.search(low) and hasattr(anon, "meta"):
                     s = anon.meta(s)
                 else:

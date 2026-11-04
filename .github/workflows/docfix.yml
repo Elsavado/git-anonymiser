@@ -1,0 +1,49 @@
+name: Docs fix
+
+# Repos anonymised before the README rule: READMEs and prose docs cleaned (informative sections only, no
+# open-source wording, no links) in ONE new commit on top; history unchanged. The repo list arrives encrypted and
+# every name is masked, so this public repo shows counts only. Busy repos are retried by the next run.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Encrypted JSON list of owner/repo
+        required: true
+
+run-name: Docs fix
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: docfix
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clean READMEs and docs
+        id: fix
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          JOB: ${{ inputs.job }}
+          JOB_KEY: ${{ secrets.JOB_KEY }}
+          BUDGET_MIN: '330'
+        run: python -I anon/docfix.py
+      - name: Hand over what is left
+        if: steps.fix.outputs.more == 'true'
+        env:
+          OWN: ${{ github.token }}
+          PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # a short run means only busy repos were left: wait an hour before trying them again
+          started=$(GH_TOKEN=$OWN gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" -q .run_started_at)
+          [ $(( $(date +%s) - $(date -d "$started" +%s) )) -lt 1800 ] && sleep 3600
+          for t in "$OWN" "$PAT"; do
+            GH_TOKEN=$t gh workflow run docfix.yml -R "${{ github.repository }}" -f job="$(cat next-job.txt)" && exit 0
+            sleep 30
+          done
