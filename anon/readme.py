@@ -75,6 +75,7 @@ def strip_open_source(text):
 
 
 def _squeeze(text):
+    text = re.sub(r"(?m)^[ 	]+$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip("\n") + "\n" if text.strip() else ""
 
@@ -155,6 +156,7 @@ A_TAG = re.compile(r"<a\b[^>]*>(.*?)</a>", re.I | re.S)
 IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
 AUTO = re.compile(r"<(?:https?|ftp|mailto):[^>]+>", re.I)
 MAILTO = re.compile(r"mailto:\S+", re.I)
+CODE_SPAN = re.compile(r"`+[^`]+`+")
 HAS_LINK = re.compile(r"`_|\.\. _|image::|figure::|\]\(|\]\[|https?://|ftp://|www\.|mailto:|<a\b|<img\b", re.I)
 LINK_ONLY_ITEM = re.compile(r"^\s*([-*+]|\d+[.)])\s*(\*\*|__)?\[[^\]]*\]\((?:[^()]|\([^()]*\))*\)(\*\*|__)?\s*$")
 
@@ -212,6 +214,8 @@ def strip_links(text):
         if not HAS_LINK.search(line):
             out.append(line)
             continue
+        if any(not _is_local(u) for span in CODE_SPAN.findall(line) for u in URL.findall(span)):
+            continue              # an inline command that needs a link (e.g. a clone URL): the line goes
         new = _unlink_line(line)
         if not line.strip():
             out.append("")
@@ -222,6 +226,26 @@ def strip_links(text):
     return _squeeze("\n".join(out))
 
 
+HTML_MEDIA = re.compile(r"<(picture|source|img|video|svg)\b[^>]*?>|</(picture|video|svg)\s*>", re.I | re.S)
+HTML_A = re.compile(r"<a\b[^>]*?>|</a\s*>", re.I | re.S)
+HTML_ALIGN = re.compile(r"<(p|div|h[1-6])\b[^>]*?\balign=[^>]*?>", re.I | re.S)
+
+
+def _html_gone(text):
+    """Multi-line HTML image / picture / anchor tags (common at the top of READMEs) go before line work."""
+    parts = re.split(r"(?m)(^\s*(?:```|~~~).*$)", text)
+    fence, out = False, []
+    for part in parts:
+        if re.match(r"^\s*(```|~~~)", part):
+            fence = not fence
+            out.append(part)
+        elif fence:
+            out.append(part)
+        else:
+            out.append(HTML_ALIGN.sub("", HTML_A.sub("", HTML_MEDIA.sub("", part))))
+    return "".join(out)
+
+
 def clean_doc(text, path):
     """README: informative sections only, no open-source wording, no links. Other docs: no open-source wording,
     no links. Returns the original text when cleaning would leave nothing."""
@@ -229,9 +253,9 @@ def clean_doc(text, path):
     if not base.startswith("readme") and not base.endswith((".md", ".mdx", ".markdown", ".rst", ".adoc")):
         return text   # code, requirements.txt, CMakeLists.txt etc. are never touched
     if base.startswith("readme"):
-        new = strip_links(trim_readme(text, base))
+        new = strip_links(trim_readme(_html_gone(text), base))
     else:
-        new = strip_links(strip_open_source(text))
+        new = strip_links(strip_open_source(_html_gone(text)))
     if not new.strip() or re.sub(r"\s+", "", new) == re.sub(r"\s+", "", text):
         return text   # nothing left, or only spacing changed: leave the file alone
     return new
