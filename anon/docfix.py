@@ -93,17 +93,24 @@ def fix(repo):
     os.makedirs(WORK, exist_ok=True)
     auth = base64.b64encode(f"x-access-token:{TOK}".encode()).decode()
     hdr = ["-c", f"http.extraheader=Authorization: Basic {auth}"]
-    r = subprocess.run(["git", *hdr, "clone", "-q", "--depth", "1", "--branch", branch, "--no-tags",
-                        f"https://github.com/{repo}.git", d], capture_output=True,
-                       env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})  # LFS files stay pointers (never edited)
+    # no checkout of the whole tree (big repos, LFS files, paths the runner cannot write): only the docs
+    nolfs = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    r = subprocess.run(["git", *hdr, "clone", "-q", "--depth", "1", "--branch", branch, "--no-tags", "--no-checkout",
+                        f"https://github.com/{repo}.git", d], capture_output=True, env=nolfs)
     if r.returncode != 0:
         print("  clone failed: " + _why(r.stderr))
         return "missing"
-    files = [f for f in git(d, "ls-files", "-z").stdout.decode("utf-8", "surrogateescape").split("\0") if f]
-    changed = 0
-    for f in files:
-        if not wanted(f):
-            continue
+    files = [f for f in git(d, "ls-tree", "-r", "-z", "--name-only", "HEAD").stdout.decode(
+        "utf-8", "surrogateescape").split("\0") if f]
+    docs = [f for f in files if wanted(f)]
+    git(d, "read-tree", "HEAD")  # index = HEAD; only the docs reach the work tree
+    for i in range(0, len(docs), 200):
+        co = subprocess.run(["git", *hdr, "checkout", "HEAD", "--", *docs[i:i + 200]], cwd=d, capture_output=True,
+                       env=nolfs)
+        if co.returncode != 0:
+            print("  docs checkout: " + _why(co.stderr))
+    changed, edited = 0, []
+    for f in docs:
         p = os.path.join(d, f)
         if os.path.islink(p) or not os.path.isfile(p) or os.path.getsize(p) > 5 * 2**20:
             continue
@@ -118,6 +125,7 @@ def fix(repo):
         if new != s:
             open(p, "wb").write(new.encode("utf-8", "surrogateescape"))
             changed += 1
+            edited.append(f)
     if not changed:
         print(f"  {len(files)} files, docs already clean")
         return "clean"
@@ -126,7 +134,8 @@ def fix(repo):
     stamp = f"{when} +0000"
     env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": stamp,
            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": stamp}
-    git(d, "add", "-A", env=env)
+    for i in range(0, len(edited), 200):
+        git(d, "add", "--", *edited[i:i + 200], env=env)  # only the edited docs: the rest of the index is HEAD
     git(d, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Docs: tidy README and guides", env=env)
     if os.environ.get("DRY") == "1":
         print(f"  {changed} docs would change (dry run)")
